@@ -1,0 +1,7 @@
+build*/
+cmake-build-*/
+.idea/
+*.a
+*.o
+*.so
+easy_se_cli
