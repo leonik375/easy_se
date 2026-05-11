@@ -13,6 +13,7 @@
 #include <string>
 #include <thread>
 #include <mutex>
+#include <condition_variable>
 #include <unordered_map>
 #include <array>
 #include <cerrno>
@@ -30,7 +31,7 @@ static std::string g_host, g_hub, g_user_str, g_pass;
 static int         g_port = 443, g_authtype = 1;
 
 /* Optional overrides (set before se_connect). */
-static int              g_keepalive_sec     = 15;
+static int              g_keepalive_sec     = 60;
 static std::string      g_static_ip, g_static_gw, g_static_dns;
 static int              g_static_prefix     = 24;
 static std::atomic<int> g_skip_default_gw{0};
@@ -39,6 +40,9 @@ static std::atomic<int> g_skip_default_gw{0};
 
 static constexpr int    ETH_HDR = 14;
 static constexpr size_t MAX_PKT = 2048;
+
+static std::mutex              g_stop_mutex;
+static std::condition_variable g_stop_cv;
 
 /* ARP cache: IPv4 (network byte order) → MAC.
    Written by the main recv thread, read by the tun_reader thread. */
@@ -445,10 +449,11 @@ static bool run_once(int tun_fd) {
     return g_user_stop.load();
 }
 
-/* Interruptible sleep: wakes early if g_user_stop is set. */
+/* Interruptible sleep: blocks until timeout or se_disconnect() signals g_stop_cv. */
 static void backoff_sleep(int seconds) {
-    for (int i = 0; i < seconds * 10 && !g_user_stop.load(); i++)
-        usleep(100000);
+    std::unique_lock<std::mutex> lk(g_stop_mutex);
+    g_stop_cv.wait_for(lk, std::chrono::seconds(seconds),
+                       [] { return g_user_stop.load(); });
 }
 
 /* ---- public API ---- */
@@ -500,6 +505,7 @@ int se_run(int tun_fd) {
 void se_disconnect() {
     g_user_stop = true;
     g_stop      = true;
+    g_stop_cv.notify_all();
     g_tunnel.interrupt();
 }
 
