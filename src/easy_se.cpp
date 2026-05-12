@@ -44,11 +44,22 @@ static constexpr size_t MAX_PKT = 2048;
 static std::mutex              g_stop_mutex;
 static std::condition_variable g_stop_cv;
 
-/* ARP cache: IPv4 (network byte order) → MAC.
-   Written by the main recv thread, read by the tun_reader thread. */
+struct ArpEntry {
+    std::array<uint8_t,6>                 mac;
+    std::chrono::steady_clock::time_point learned_at;
+    std::chrono::steady_clock::time_point probed_at;
+    bool                                  probing{false};
+};
+static constexpr int ARP_STALE_SEC        = 60; /* start NUD probe after this many seconds */
+static constexpr int ARP_PROBE_TIMEOUT_SEC = 3; /* evict if no reply within this window    */
+
+/* ARP cache: IPv4 (network byte order) → ArpEntry.
+   Stale entries (age ≥ ARP_STALE_SEC) trigger a background NUD probe while the
+   cached MAC is still used. If no reply arrives within ARP_PROBE_TIMEOUT_SEC the
+   entry is evicted; the next miss re-ARPs from scratch. */
 static std::mutex g_arp_mutex;
-static std::unordered_map<uint32_t, std::array<uint8_t,6>> g_arp_cache;
-/* Rate-limit outbound ARP requests: ip → time of last request sent. */
+static std::unordered_map<uint32_t, ArpEntry> g_arp_cache;
+/* Rate-limit outbound ARP requests on cache misses: ip → time of last request. */
 static std::unordered_map<uint32_t, std::chrono::steady_clock::time_point> g_arp_requested;
 
 /* TCP demux: local port → VpnTcpConn for userspace proxy connections. */
@@ -58,9 +69,11 @@ static std::unordered_map<uint16_t, VpnTcpConn*> g_tcp_demux;
 static void arp_cache_put(uint32_t ip_net, const uint8_t *mac) {
     DBG("[arp-learn] ip=%08x mac=%02x:%02x:%02x:%02x:%02x:%02x\n",
         ip_net, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-    std::array<uint8_t,6> m; memcpy(m.data(), mac, 6);
     std::lock_guard<std::mutex> lk(g_arp_mutex);
-    g_arp_cache[ip_net] = m;
+    auto &e      = g_arp_cache[ip_net];
+    memcpy(e.mac.data(), mac, 6);
+    e.learned_at = std::chrono::steady_clock::now();
+    e.probing    = false;
     g_arp_requested.erase(ip_net);
 }
 
@@ -108,31 +121,64 @@ static void send_arp_request(uint32_t target_ip_net) {
 static void resolve_dst_mac(const uint8_t *ip_pkt, ssize_t n, uint8_t *dst_mac) {
     if (n < 20) { memset(dst_mac, 0xff, 6); return; }
 
-    uint32_t dst_net  = *reinterpret_cast<const uint32_t*>(ip_pkt + 16);
-    uint32_t mask     = prefix_mask(g_ip.prefix);
-    uint32_t gw_net   = (uint32_t)inet_addr(g_ip.gw.c_str());
+    uint32_t dst_net   = *reinterpret_cast<const uint32_t*>(ip_pkt + 16);
+    uint32_t mask      = prefix_mask(g_ip.prefix);
+    uint32_t gw_net    = (uint32_t)inet_addr(g_ip.gw.c_str());
     uint32_t lookup_ip = ((dst_net & mask) == (g_ip.our_ip_net & mask))
                           ? dst_net : gw_net;
 
+    using Clock  = std::chrono::steady_clock;
+    using Sec    = std::chrono::seconds;
+    auto now     = Clock::now();
     bool need_arp = false;
+
     {
         std::lock_guard<std::mutex> lk(g_arp_mutex);
         auto it = g_arp_cache.find(lookup_ip);
         if (it != g_arp_cache.end()) {
-            DBG("[resolve] arp-hit ip=%08x → %02x:%02x:%02x:%02x:%02x:%02x\n",
-                lookup_ip, it->second[0], it->second[1], it->second[2],
-                it->second[3], it->second[4], it->second[5]);
-            memcpy(dst_mac, it->second.data(), 6);
-            return;
-        }
-        /* Cache miss — use broadcast for this packet, send ARP request */
-        memset(dst_mac, 0xff, 6);
-        auto now = std::chrono::steady_clock::now();
-        auto pit = g_arp_requested.find(lookup_ip);
-        if (pit == g_arp_requested.end() ||
-            now - pit->second > std::chrono::seconds(1)) {
-            g_arp_requested[lookup_ip] = now;
-            need_arp = true;
+            ArpEntry &e = it->second;
+            if (!e.probing) {
+                /* Entry is current (or first-seen stale) — give caller the MAC */
+                memcpy(dst_mac, e.mac.data(), 6);
+                auto age = std::chrono::duration_cast<Sec>(now - e.learned_at).count();
+                if (age >= ARP_STALE_SEC) {
+                    /* Gone stale: fire a background NUD probe, keep using cached MAC */
+                    DBG("[resolve] stale ip=%08x age=%llds, NUD probe\n",
+                        lookup_ip, (long long)age);
+                    e.probing   = true;
+                    e.probed_at = now;
+                    need_arp    = true; /* send probe after lock release */
+                } else {
+                    DBG("[resolve] arp-hit ip=%08x\n", lookup_ip);
+                }
+                if (!need_arp) return; /* fresh hit — nothing more to do */
+            } else {
+                /* NUD probe already in flight */
+                auto probe_age = std::chrono::duration_cast<Sec>(
+                                     now - e.probed_at).count();
+                if (probe_age < ARP_PROBE_TIMEOUT_SEC) {
+                    /* Still waiting for the reply — use cached MAC */
+                    memcpy(dst_mac, e.mac.data(), 6);
+                    DBG("[resolve] probing ip=%08x probe_age=%llds\n",
+                        lookup_ip, (long long)probe_age);
+                    return;
+                }
+                /* Probe timed out — MAC is stale, evict and re-ARP */
+                DBG("[resolve] NUD timeout ip=%08x, evicting\n", lookup_ip);
+                g_arp_cache.erase(it);
+                memset(dst_mac, 0xff, 6);
+                g_arp_requested[lookup_ip] = now;
+                need_arp = true;
+            }
+        } else {
+            /* Cache miss — broadcast for this packet, rate-limited ARP request */
+            memset(dst_mac, 0xff, 6);
+            auto pit = g_arp_requested.find(lookup_ip);
+            if (pit == g_arp_requested.end() ||
+                now - pit->second > Sec(1)) {
+                g_arp_requested[lookup_ip] = now;
+                need_arp = true;
+            }
         }
     }
     if (need_arp) send_arp_request(lookup_ip);
@@ -208,7 +254,7 @@ bool vpn_lookup_mac(uint32_t ip_net, uint8_t *mac_out) {
     std::lock_guard<std::mutex> lk(g_arp_mutex);
     auto it = g_arp_cache.find(ip_net);
     if (it == g_arp_cache.end()) return false;
-    memcpy(mac_out, it->second.data(), 6);
+    memcpy(mac_out, it->second.mac.data(), 6);
     return true;
 }
 
