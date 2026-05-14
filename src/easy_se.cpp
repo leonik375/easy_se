@@ -231,7 +231,8 @@ static void probe_gateway_arp(uint32_t gw_n, int timeout_ms) {
         }
 
         uint8_t *arp = eth + ETH_HDR;
-        uint32_t sender_ip = *reinterpret_cast<uint32_t *>(arp + 14);
+        uint32_t sender_ip;
+        memcpy(&sender_ip, arp + 14, sizeof(sender_ip));   /* unaligned-safe */
         struct in_addr sa; sa.s_addr = sender_ip;
         DBG("[arp-probe] ARP from %s op=%d\n", inet_ntoa(sa), (arp[6]<<8|arp[7]));
         arp_cache_put(sender_ip, arp + 8);
@@ -456,7 +457,9 @@ static bool run_once(int tun_fd) {
 
         if (etype == 0x0806 && frame_len >= ETH_HDR + 28) {
             uint8_t *arp = eth + ETH_HDR;
-            arp_cache_put(*reinterpret_cast<uint32_t*>(arp + 14), arp + 8);
+            uint32_t sender_ip;
+            memcpy(&sender_ip, arp + 14, sizeof(sender_ip)); /* unaligned-safe */
+            arp_cache_put(sender_ip, arp + 8);
 
             if ((arp[6]<<8|arp[7]) == 1 &&
                 memcmp(arp + 24, &g_ip.our_ip_net, 4) == 0) {

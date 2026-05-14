@@ -945,7 +945,8 @@ int Tunnel::recv_udp_frame_(uint8_t *buf, size_t buflen, int timeout_ms) {
         size_t   rem = in_n - 20;
 
         if (rem < 4) return 0;
-        uint32_t cookie = ntohl(*reinterpret_cast<uint32_t*>(q)); q += 4; rem -= 4;
+        uint32_t cookie;
+        memcpy(&cookie, q, 4); cookie = ntohl(cookie);            q += 4; rem -= 4;
         if (cookie != udp_my_cookie_) return 0;
 
         if (rem < 8) return 0;
@@ -956,7 +957,8 @@ int Tunnel::recv_udp_frame_(uint8_t *buf, size_t buflen, int timeout_ms) {
         udp_last_peer_tick_ = peer_your_tick;
 
         if (rem < 3) return 0;
-        uint16_t data_size = ntohs(*reinterpret_cast<uint16_t*>(q)); q += 2; rem -= 2;
+        uint16_t data_size;
+        memcpy(&data_size, q, 2); data_size = ntohs(data_size);   q += 2; rem -= 2;
         /* flag */                                                    q++;    rem--;
 
         udp_ready_ = true; /* server is reachable via UDP */
@@ -971,12 +973,14 @@ int Tunnel::recv_udp_frame_(uint8_t *buf, size_t buflen, int timeout_ms) {
     /* Plain-text mode (no encryption) */
     if (n < 23) return 0;
     uint8_t *q = pkt;
-    uint32_t cookie = ntohl(*reinterpret_cast<uint32_t*>(q)); q += 4; n -= 4;
+    uint32_t cookie;
+    memcpy(&cookie, q, 4); cookie = ntohl(cookie); q += 4; n -= 4;
     if (cookie != udp_my_cookie_) return 0;
     q += 8; n -= 8; /* peer_my_tick */
     udp_last_peer_tick_ = rd_be64(q); q += 8; n -= 8;
     if (n < 3) return 0;
-    uint16_t data_size = ntohs(*reinterpret_cast<uint16_t*>(q)); q += 2; n -= 2;
+    uint16_t data_size;
+    memcpy(&data_size, q, 2); data_size = ntohs(data_size); q += 2; n -= 2;
     q++; n--; /* flag */
     udp_ready_ = true;
     if (data_size == 0 || n < data_size || data_size > (ssize_t)buflen) return 0;
