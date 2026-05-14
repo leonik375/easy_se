@@ -322,6 +322,13 @@ int main(int argc, char *argv[]) {
     /* Line-buffer stdout so journalctl flushes per-line under systemd. */
     setvbuf(stdout, nullptr, _IOLBF, 0);
 
+    /* Ignore SIGPIPE *before* anything else that might write to a socket
+       or pipe (proxy bridges, JNI stdio, etc.).  The proxy's bridge_rx
+       does plain ::write(socketpair, …) which delivers SIGPIPE on a
+       closed peer — default disposition is process termination with
+       exit code 141, no output, no signal handler observed. */
+    signal(SIGPIPE, SIG_IGN);
+
     /* Pass 1: --config (lowest precedence; populates env without overriding
        anything the caller already exported). */
     for (int i = 1; i < argc; ++i) {
@@ -483,11 +490,7 @@ int main(int argc, char *argv[]) {
     signal(SIGINT,  on_signal);
     signal(SIGTERM, on_signal);
     signal(SIGHUP,  on_signal);
-    /* SIGPIPE is the most common cause of silent-clean-exit: the proxy
-       bridges write to socketpairs whose other end may have closed.
-       Ignore it process-wide — affected sends will just return EPIPE
-       and the bridge thread handles that locally. */
-    signal(SIGPIPE, SIG_IGN);
+    /* SIGPIPE already ignored at the top of main(). */
 
     printf("Forwarding. SIGINT/SIGTERM to disconnect.\n");
     rc = se_run(g_tun_fd);

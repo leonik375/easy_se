@@ -2,6 +2,7 @@
 #include "tcp_conn.hpp"
 
 #include <arpa/inet.h>
+#include <signal.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <poll.h>
@@ -379,6 +380,19 @@ void *ProxyServer::listener_thread(void *arg) {
 
 int ProxyServer::start(int port) {
     if (running_) return port_;
+
+    /* Defensive: ignore SIGPIPE for callers (CLI / JNI / library users)
+       that forgot.  The bridge threads do plain ::write(socketpair, …)
+       which delivers SIGPIPE on a closed peer — default disposition is
+       process termination with exit code 141 and no output. */
+    struct sigaction sigact{};
+    sigaction(SIGPIPE, nullptr, &sigact);
+    if (sigact.sa_handler != SIG_IGN) {
+        sigact.sa_handler = SIG_IGN;
+        sigemptyset(&sigact.sa_mask);
+        sigact.sa_flags = 0;
+        sigaction(SIGPIPE, &sigact, nullptr);
+    }
 
     if (::pipe(pipe_) != 0) return -1;
 
