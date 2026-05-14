@@ -315,17 +315,13 @@ ssize_t VpnTcpConn::recv(void *buf, size_t len) {
    destroyed, even if state_ is already CLOSED — otherwise the std::thread
    member destructor finds it joinable and calls std::terminate(). */
 void VpnTcpConn::close() {
-    bool should_fin        = false;
-    bool should_unregister = false;
+    bool should_fin = false;
     {
         std::lock_guard<std::mutex> lk(mtx_);
-        if (state_ != State::CLOSED) {
-            if (state_ == State::ESTABLISHED || state_ == State::CLOSE_WAIT)
-                should_fin = true;
-            state_            = State::CLOSED;
-            rx_eof_           = true;
-            should_unregister = true;
-        }
+        if (state_ == State::ESTABLISHED || state_ == State::CLOSE_WAIT)
+            should_fin = true;
+        state_     = State::CLOSED;
+        rx_eof_    = true;
         stop_retx_ = true;
         cv_.notify_all();
     }
@@ -336,7 +332,14 @@ void VpnTcpConn::close() {
     std::call_once(retx_join_once_, [this] {
         if (retx_thread_.joinable()) retx_thread_.join();
     });
-    if (should_unregister) vpn_tcp_unregister(local_port_);
+    /* Unregister exactly once.  Critical: retx_loop_'s give-up branch and
+       deliver()'s RST handler set state_=CLOSED without going through this
+       path; if we conditionally skipped the unregister "because state_ is
+       already CLOSED", g_tcp_demux would keep a dangling pointer after
+       the VpnTcpConn is freed → UAF when the recv loop dereferences it. */
+    std::call_once(unregister_once_, [this] {
+        if (local_port_) vpn_tcp_unregister(local_port_);
+    });
 }
 
 /* ── deliver (called from recv loop, no locks held by caller) ────────────── */

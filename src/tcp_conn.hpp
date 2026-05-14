@@ -123,6 +123,12 @@ private:
        bridge_rx and bridge_tx (and the destructor) can't all race onto
        join() simultaneously (UB on the same std::thread). */
     std::once_flag      retx_join_once_;
+    /* Same idea for vpn_tcp_unregister(local_port_): must run exactly once
+       across all the paths that mark a connection dead (close(), the retx-
+       give-up branch, RST in deliver(), and the destructor).  Without this
+       the entry in g_tcp_demux outlives the VpnTcpConn → UAF in the recv
+       loop's tcp_demux_deliver. */
+    std::once_flag      unregister_once_;
 
     static constexpr int RTO_INITIAL_MS = 200;      /* aggressive for lossy paths */
     static constexpr int RTO_MAX_MS     = 32000;
