@@ -307,6 +307,20 @@ std::optional<Pack> Tunnel::pack_recv() {
 
 bool Tunnel::connect(const std::string &host, int port,
                      bool verify_cert, const std::string &ca_path) {
+    /* Re-entrant safety: a prior partially-failed connect (e.g. dhcp_probe
+       returned nullopt) may have left tx_thread_ running.  Tear it down
+       cleanly before spawning a new one — std::thread::operator= on a
+       joinable target calls std::terminate. */
+    if (tx_thread_.joinable()) {
+        {
+            std::lock_guard<std::mutex> lk(tx_mutex_);
+            tx_stop_ = true;
+        }
+        tx_cv_.notify_all();
+        tx_thread_.join();
+        std::lock_guard<std::mutex> lk(tx_mutex_);
+        tx_queue_.clear();
+    }
     host_ = host;
 
     /* Resolve */
@@ -366,7 +380,14 @@ bool Tunnel::connect(const std::string &host, int port,
         if (SSL_set1_host(ssl_, host.c_str()) != 1) return false;
     }
 
-    return SSL_connect(ssl_) == 1;
+    if (SSL_connect(ssl_) != 1) return false;
+
+    /* TLS up — start the TX flusher thread that batches send_frame()
+       calls into multi-block Cedar records (see tx_loop_). */
+    tx_stop_ = false;
+    tx_dead_.store(false);
+    tx_thread_ = std::thread([this] { tx_loop_(); });
+    return true;
 }
 
 bool Tunnel::handshake() {
@@ -539,18 +560,75 @@ bool Tunnel::authenticate(const std::string &hub,
    ------------------------------------------------------------------------- */
 
 bool Tunnel::send_frame(const uint8_t *eth, size_t len) {
-    /* Build Cedar block in one contiguous buffer → single TLS record. */
-    static constexpr size_t HDR = 8;
-    static constexpr size_t MAX = HDR + 14 + 2048; /* 8 + max Ethernet frame */
-    if (len > MAX - HDR) return false;
-    uint8_t buf[MAX];
-    const uint32_t one = htonl(1u);
-    const uint32_t sz  = htonl(static_cast<uint32_t>(len));
-    memcpy(buf,     &one, 4);
-    memcpy(buf + 4, &sz,  4);
-    memcpy(buf + 8, eth, len);
-    std::lock_guard<std::mutex> lk(send_mutex_);
-    return ssl_writen(buf, HDR + len);
+    /* Enqueue for the tx_thread_ to batch with other pending frames.
+       Returns false only if the tx_thread has already declared the tunnel
+       dead (SSL_write failed and there's no point queueing more). */
+    if (len == 0 || len > 2048 + 14) return false;
+    if (tx_dead_.load(std::memory_order_relaxed)) return false;
+    {
+        std::lock_guard<std::mutex> lk(tx_mutex_);
+        tx_queue_.emplace_back(eth, eth + len);
+    }
+    tx_cv_.notify_one();
+    return true;
+}
+
+/* tx_loop_: pulls frames off the queue, packs up to TX_MAX_BATCH (or
+   TX_MAX_BATCH_BYTES) into one Cedar block (num_blocks > 1) and writes
+   them with a single SSL_write.  This is the single biggest win for
+   bulk traffic — before, every small frame was its own SSL_write +
+   TLS record + send_mutex_ acquire. */
+void Tunnel::tx_loop_() {
+    std::vector<uint8_t>             batch;
+    std::deque<std::vector<uint8_t>> frames;
+    batch.reserve(TX_MAX_BATCH_BYTES + 4096);
+    for (;;) {
+        {
+            std::unique_lock<std::mutex> lk(tx_mutex_);
+            tx_cv_.wait(lk, [this] {
+                return tx_stop_ || !tx_queue_.empty();
+            });
+            if (tx_stop_ && tx_queue_.empty()) return;
+            /* Take as much of the queue as fits into one batch.  Cap on
+               count AND on cumulative bytes so we don't build a 1 MB
+               Cedar block on a sudden burst. */
+            size_t total_bytes = 0;
+            while (!tx_queue_.empty() &&
+                   frames.size() < TX_MAX_BATCH &&
+                   total_bytes + tx_queue_.front().size() + 4 <=
+                       TX_MAX_BATCH_BYTES) {
+                total_bytes += tx_queue_.front().size() + 4;
+                frames.push_back(std::move(tx_queue_.front()));
+                tx_queue_.pop_front();
+            }
+        }
+
+        /* Build: uint32_BE(num_blocks) [ uint32_BE(size) bytes ... ] */
+        batch.clear();
+        uint32_t num_net = htonl(static_cast<uint32_t>(frames.size()));
+        const uint8_t *np = reinterpret_cast<const uint8_t*>(&num_net);
+        batch.insert(batch.end(), np, np + 4);
+        for (auto &f : frames) {
+            uint32_t sz_net = htonl(static_cast<uint32_t>(f.size()));
+            const uint8_t *sp = reinterpret_cast<const uint8_t*>(&sz_net);
+            batch.insert(batch.end(), sp, sp + 4);
+            batch.insert(batch.end(), f.begin(), f.end());
+        }
+        frames.clear();
+
+        bool ok;
+        {
+            std::lock_guard<std::mutex> lk(send_mutex_);
+            ok = ssl_writen(batch.data(), batch.size());
+        }
+        if (!ok) {
+            tx_dead_.store(true, std::memory_order_relaxed);
+            /* Drain pending so memory doesn't grow until close() runs. */
+            std::lock_guard<std::mutex> lk(tx_mutex_);
+            tx_queue_.clear();
+            /* Stay in loop until tx_stop_ — close() will set it and join. */
+        }
+    }
 }
 
 bool Tunnel::send_keepalive() {
@@ -1035,6 +1113,18 @@ void Tunnel::interrupt() {
 }
 
 void Tunnel::close() {
+    /* Stop the TX flusher BEFORE freeing SSL/the socket so its in-flight
+       SSL_write completes cleanly (or errors out, also fine). */
+    if (tx_thread_.joinable()) {
+        {
+            std::lock_guard<std::mutex> lk(tx_mutex_);
+            tx_stop_ = true;
+        }
+        tx_cv_.notify_all();
+        tx_thread_.join();
+        std::lock_guard<std::mutex> lk(tx_mutex_);
+        tx_queue_.clear();
+    }
     if (ssl_) { SSL_shutdown(ssl_); SSL_free(ssl_); ssl_ = nullptr; }
     if (ctx_) { SSL_CTX_free(ctx_); ctx_ = nullptr; }
     if (fd_ >= 0) { ::close(fd_); fd_ = -1; }

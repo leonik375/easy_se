@@ -3,7 +3,10 @@
 #include <optional>
 #include <string>
 #include <vector>
+#include <deque>
 #include <mutex>
+#include <condition_variable>
+#include <thread>
 #include <openssl/ssl.h>
 #include <netinet/in.h>
 #include <atomic>
@@ -115,6 +118,23 @@ private:
 
     /* Remaining frames in the current Cedar batch (may be > 1). */
     uint32_t pending_blocks_ = 0;
+
+    /* ── Batched TX path ────────────────────────────────────────────────
+       send_frame() enqueues an Ethernet frame and returns immediately.
+       A single tx_thread_ drains the queue, packs up to MAX_BATCH frames
+       into one Cedar block (num_blocks > 1) and writes them with one
+       SSL_write — amortising TLS-record/MAC overhead across many small
+       VPN packets.  Without batching, each small frame (84-200 B) was
+       its own SSL_write → throughput cliff on bulk proxy traffic. */
+    std::mutex                       tx_mutex_;
+    std::condition_variable          tx_cv_;
+    std::deque<std::vector<uint8_t>> tx_queue_;
+    std::thread                      tx_thread_;
+    bool                             tx_stop_  = false;
+    std::atomic<bool>                tx_dead_{false};
+    static constexpr size_t          TX_MAX_BATCH      = 32;
+    static constexpr size_t          TX_MAX_BATCH_BYTES = 16 * 1024;
+    void tx_loop_();
 
     /* Low-level SSL I/O */
     bool ssl_writen(const void *buf, size_t n);
