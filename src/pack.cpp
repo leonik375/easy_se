@@ -36,7 +36,8 @@ struct Reader {
 
     bool read(void *out, size_t n) {
         if (rem < n) { rem = SIZE_MAX; return false; }
-        memcpy(out, p, n); p += n; rem -= n;
+        if (n) memcpy(out, p, n);   /* memcpy w/ n=0 and nullptr is UB */
+        p += n; rem -= n;
         return true;
     }
 
