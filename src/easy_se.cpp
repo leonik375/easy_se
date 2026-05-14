@@ -38,6 +38,7 @@ static std::atomic<int> g_skip_default_gw{0};
 static std::atomic<int> g_verify_cert{1};   /* default ON: secure by default */
 static std::mutex       g_ca_path_mutex;
 static std::string      g_ca_path;
+static std::atomic<int> g_use_udp_accel{1}; /* default ON; toggle off for lossy paths */
 
 #define DBG(...) do { if (g_debug) fprintf(stderr, __VA_ARGS__); } while(0)
 
@@ -578,6 +579,8 @@ void se_set_debug(int enable) {
 bool vpn_debug() { return g_debug;
 }
 
+bool vpn_use_udp_accel() { return g_use_udp_accel.load() != 0; }
+
 void se_set_keepalive(int seconds) {
     g_keepalive_sec = (seconds > 0) ? seconds : 15;
 }
@@ -597,6 +600,8 @@ void se_set_skip_default_gw(int skip) { g_skip_default_gw.store(skip != 0 ? 1 : 
 int  se_get_skip_default_gw(void)    { return g_skip_default_gw.load(); }
 
 void se_set_verify_cert(int enable) { g_verify_cert.store(enable != 0 ? 1 : 0); }
+
+void se_set_use_udp_accel(int enable) { g_use_udp_accel.store(enable != 0 ? 1 : 0); }
 
 void se_set_ca_path(const char *path) {
     std::lock_guard<std::mutex> lk(g_ca_path_mutex);

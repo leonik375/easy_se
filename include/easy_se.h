@@ -41,6 +41,13 @@ void se_force_reconnect(void);
 /* Enable/disable verbose debug logging to stderr (default: off). */
 void se_set_debug(int enable);
 
+/* Enable SoftEther's UDP acceleration (default: 1 = enabled).
+   When enabled, frames go over RC4-over-UDP for lower latency once the
+   server confirms the channel.  On lossy paths (e.g. some NAT64 / mobile
+   networks) the UDP path can drop heavily, and falling back to TCP-only
+   over the TLS connection is more reliable at the cost of latency. */
+void se_set_use_udp_accel(int enable);
+
 /* Enable TLS server-certificate validation (default: 1 = enabled).
    When enabled, the server cert is validated against the configured CA store
    AND the certificate's hostname is matched against the connect host.

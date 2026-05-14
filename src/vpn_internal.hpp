@@ -8,6 +8,7 @@ class VpnTcpConn;
    Not part of the public API. */
 
 bool vpn_debug();
+bool vpn_use_udp_accel();
 
 uint32_t       vpn_our_ip_net();
 const uint8_t *vpn_our_mac();

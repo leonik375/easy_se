@@ -61,7 +61,8 @@ uint16_t VpnTcpConn::alloc_local_port() {
 
 /* ── send_segment ────────────────────────────────────────────────────────── */
 
-void VpnTcpConn::send_segment(uint8_t flags, const void *data, size_t dlen) {
+void VpnTcpConn::send_segment_seq(uint8_t flags, uint32_t seq,
+                                  const void *data, size_t dlen) {
     static std::atomic<uint16_t> ip_id{1};
 
     size_t frame_sz = ETH_HDR + IP_HDR + TCP_HDR + dlen;
@@ -99,8 +100,8 @@ void VpnTcpConn::send_segment(uint8_t flags, const void *data, size_t dlen) {
     tcp[0] = local_port_  >> 8; tcp[1] = local_port_  & 0xff;
     tcp[2] = remote_port_ >> 8; tcp[3] = remote_port_ & 0xff;
 
-    tcp[4] = snd_nxt_ >> 24; tcp[5] = (snd_nxt_ >> 16) & 0xff;
-    tcp[6] = (snd_nxt_ >>  8) & 0xff; tcp[7] = snd_nxt_ & 0xff;
+    tcp[4] = seq >> 24; tcp[5] = (seq >> 16) & 0xff;
+    tcp[6] = (seq >>  8) & 0xff; tcp[7] = seq & 0xff;
 
     uint32_t ack_val = (flags & 0x10) ? rcv_nxt_ : 0;
     tcp[8]  = ack_val >> 24; tcp[9]  = (ack_val >> 16) & 0xff;
@@ -119,6 +120,71 @@ void VpnTcpConn::send_segment(uint8_t flags, const void *data, size_t dlen) {
     vpn_send_frame(f, frame_sz);
 }
 
+void VpnTcpConn::send_segment(uint8_t flags, const void *data, size_t dlen) {
+    send_segment_seq(flags, snd_nxt_, data, dlen);
+}
+
+/* Drain reorder buffer entries that are now contiguous with rcv_nxt_.
+   Caller holds mtx_. */
+void VpnTcpConn::drain_reorder_() {
+    auto it = oo_buf_.find(rcv_nxt_);
+    while (it != oo_buf_.end()) {
+        rx_buf_.insert(rx_buf_.end(), it->second.begin(), it->second.end());
+        rcv_nxt_  += static_cast<uint32_t>(it->second.size());
+        oo_total_ -= it->second.size();
+        oo_buf_.erase(it);
+        it = oo_buf_.find(rcv_nxt_);
+    }
+}
+
+/* Retransmit loop.  Sleeps until either the head retx segment's RTO expires
+   or someone notifies (new send, ACK received, or shutdown). */
+void VpnTcpConn::retx_loop_() {
+    std::unique_lock<std::mutex> lk(mtx_);
+    while (!stop_retx_) {
+        if (retx_q_.empty() || state_ != State::ESTABLISHED) {
+            cv_.wait(lk, [this] {
+                return stop_retx_ ||
+                       (!retx_q_.empty() && state_ == State::ESTABLISHED);
+            });
+            continue;
+        }
+
+        auto deadline = retx_q_.front().sent_at +
+                        std::chrono::milliseconds(rto_ms_);
+        auto status   = cv_.wait_until(lk, deadline);
+
+        if (stop_retx_) break;
+        if (status != std::cv_status::timeout) continue;   /* spurious / ACK */
+        if (retx_q_.empty()) continue;
+        if (state_ != State::ESTABLISHED) continue;
+
+        auto now = std::chrono::steady_clock::now();
+        if (now < retx_q_.front().sent_at +
+                  std::chrono::milliseconds(rto_ms_))
+            continue;
+
+        /* RTO fired — retransmit head segment.  Give up after RETX_MAX_TRIES. */
+        auto &head = retx_q_.front();
+        if (head.retx_count >= RETX_MAX_TRIES) {
+            DBG("[tcp] retx give-up after %d tries; closing\n", head.retx_count);
+            state_  = State::CLOSED;
+            rx_eof_ = true;
+            cv_.notify_all();
+            break;
+        }
+        head.sent_at = now;
+        head.retx_count++;
+        rto_ms_ = std::min(rto_ms_ * 2, RTO_MAX_MS);   /* exponential backoff */
+        uint32_t seq    = head.seq;
+        size_t   dlen   = head.data.size();
+        std::vector<uint8_t> data = head.data;          /* copy under lock */
+        lk.unlock();
+        send_segment_seq(0x18, seq, data.data(), dlen); /* PSH+ACK */
+        lk.lock();
+    }
+}
+
 /* ── connect ─────────────────────────────────────────────────────────────── */
 
 bool VpnTcpConn::connect(uint32_t dst_ip_net, uint16_t dst_port, int timeout_ms) {
@@ -130,6 +196,7 @@ bool VpnTcpConn::connect(uint32_t dst_ip_net, uint16_t dst_port, int timeout_ms)
     /* Random-ish ISN derived from monotonic clock */
     snd_nxt_ = static_cast<uint32_t>(
         std::chrono::steady_clock::now().time_since_epoch().count());
+    snd_una_ = snd_nxt_;
 
     struct in_addr da; da.s_addr = dst_ip_net;
     DBG("[tcp] connect %s:%u src_ip=%08x local_port=%u\n",
@@ -137,8 +204,8 @@ bool VpnTcpConn::connect(uint32_t dst_ip_net, uint16_t dst_port, int timeout_ms)
 
     /* Trigger ARP for the gateway so the recv loop can process the reply and
        populate the cache while we wait for SYN-ACK.  We re-send the SYN every
-       2 s; by the second attempt the ARP reply will have been processed and the
-       SYN will reach SecureNAT as a unicast frame (broadcast is ignored). */
+       200 ms; by the second attempt the ARP reply will have been processed and
+       the SYN will reach SecureNAT as a unicast frame (broadcast is ignored). */
     uint32_t gw = vpn_gateway_ip_net();
     vpn_probe_arp(gw, 0); /* fire-and-forget: kick the ARP request, don't block */
 
@@ -152,22 +219,23 @@ bool VpnTcpConn::connect(uint32_t dst_ip_net, uint16_t dst_port, int timeout_ms)
     std::unique_lock<std::mutex> lk(mtx_);
     auto deadline = std::chrono::steady_clock::now()
                   + std::chrono::milliseconds(timeout_ms);
+    int syn_rto = RTO_INITIAL_MS;
     while (!connect_done_) {
         auto now = std::chrono::steady_clock::now();
         if (now >= deadline) break;
-        auto wait = std::min(std::chrono::milliseconds(2000),
+        auto wait = std::min(std::chrono::milliseconds(syn_rto),
                              std::chrono::duration_cast<std::chrono::milliseconds>(
                                  deadline - now));
         cv_.wait_for(lk, wait, [this] { return connect_done_; });
         if (connect_done_ || std::chrono::steady_clock::now() >= deadline) break;
         if (state_ != State::SYN_SENT) break;
-        /* Retransmit SYN — ARP should be resolved by now */
-        DBG("[tcp] retransmit SYN → %s:%u\n", inet_ntoa(da), dst_port);
-        snd_nxt_ = isn;
+        /* Retransmit SYN with exponential backoff. */
+        DBG("[tcp] retransmit SYN → %s:%u (rto=%dms)\n",
+            inet_ntoa(da), dst_port, syn_rto);
         lk.unlock();
-        send_segment(0x02);
+        send_segment_seq(0x02, isn, nullptr, 0);
         lk.lock();
-        snd_nxt_ = isn + 1;
+        syn_rto = std::min(syn_rto * 2, RTO_MAX_MS);
     }
 
     bool ok = connect_done_;
@@ -179,6 +247,13 @@ bool VpnTcpConn::connect(uint32_t dst_ip_net, uint16_t dst_port, int timeout_ms)
         vpn_tcp_unregister(local_port_);
         return false;
     }
+    snd_una_  = snd_nxt_;
+    last_ack_ = snd_nxt_;
+    lk.unlock();
+    /* Start retransmit timer thread now that the connection is established.
+       Spawned outside the lock to avoid retx_loop_() racing onto a held mtx_. */
+    stop_retx_ = false;
+    retx_thread_ = std::thread([this] { retx_loop_(); });
     DBG("[tcp] connect %s:%u established\n", inet_ntoa(da), dst_port);
     return true;
 }
@@ -188,10 +263,22 @@ bool VpnTcpConn::connect(uint32_t dst_ip_net, uint16_t dst_port, int timeout_ms)
 bool VpnTcpConn::send(const void *buf, size_t len) {
     const auto *p = static_cast<const uint8_t *>(buf);
     while (len > 0) {
+        std::unique_lock<std::mutex> lk(mtx_);
         if (state_ != State::ESTABLISHED) return false;
+
         size_t chunk = std::min(len, MSS);
-        send_segment(0x18, p, chunk);          /* PSH + ACK */
+        uint32_t seq = snd_nxt_;
+        std::vector<uint8_t> data(p, p + chunk);
+
+        send_segment_seq(0x18, seq, data.data(), chunk); /* PSH+ACK */
         snd_nxt_ += static_cast<uint32_t>(chunk);
+
+        /* Queue for potential retransmit until ACKed. */
+        retx_q_.push_back({seq, std::move(data),
+                          std::chrono::steady_clock::now(), 0});
+        cv_.notify_all();   /* wake retx thread to set/refresh its timer */
+
+        lk.unlock();
         p   += chunk;
         len -= chunk;
     }
@@ -202,11 +289,21 @@ bool VpnTcpConn::send(const void *buf, size_t len) {
 
 ssize_t VpnTcpConn::recv(void *buf, size_t len) {
     std::unique_lock<std::mutex> lk(mtx_);
-    cv_.wait(lk, [this] { return !rx_buf_.empty() || rx_eof_; });
-    if (rx_buf_.empty()) return 0;             /* EOF */
-    size_t n = std::min(len, rx_buf_.size());
-    memcpy(buf, rx_buf_.data(), n);
-    rx_buf_.erase(rx_buf_.begin(), rx_buf_.begin() + static_cast<ptrdiff_t>(n));
+    cv_.wait(lk, [this] {
+        return rx_read_pos_ < rx_buf_.size() || rx_eof_;
+    });
+    size_t avail = rx_buf_.size() - rx_read_pos_;
+    if (avail == 0) return 0;                  /* EOF */
+    size_t n = std::min(len, avail);
+    memcpy(buf, rx_buf_.data() + rx_read_pos_, n);
+    rx_read_pos_ += n;
+    /* Compact when more than half the buffer is consumed — keeps memory
+       bounded without doing it on every read (O(amortised 1)). */
+    if (rx_read_pos_ > 0 && rx_read_pos_ >= rx_buf_.size() / 2) {
+        rx_buf_.erase(rx_buf_.begin(),
+                      rx_buf_.begin() + static_cast<ptrdiff_t>(rx_read_pos_));
+        rx_read_pos_ = 0;
+    }
     return static_cast<ssize_t>(n);
 }
 
@@ -219,11 +316,13 @@ void VpnTcpConn::close() {
         if (state_ == State::CLOSED) return;
         if (state_ == State::ESTABLISHED || state_ == State::CLOSE_WAIT)
             should_fin = true;
-        state_  = State::CLOSED;
-        rx_eof_ = true;
+        state_     = State::CLOSED;
+        rx_eof_    = true;
+        stop_retx_ = true;
         cv_.notify_all();
     }
     if (should_fin) send_segment(0x11);        /* FIN + ACK */
+    if (retx_thread_.joinable()) retx_thread_.join();
     vpn_tcp_unregister(local_port_);
 }
 
@@ -241,6 +340,10 @@ void VpnTcpConn::deliver(const uint8_t *tcp, size_t tcp_len, uint32_t src_ip_net
                  | (static_cast<uint32_t>(tcp[5]) << 16)
                  | (static_cast<uint32_t>(tcp[6]) <<  8)
                  |  static_cast<uint32_t>(tcp[7]);
+    uint32_t ack = (static_cast<uint32_t>(tcp[8])  << 24)
+                 | (static_cast<uint32_t>(tcp[9])  << 16)
+                 | (static_cast<uint32_t>(tcp[10]) <<  8)
+                 |  static_cast<uint32_t>(tcp[11]);
 
     size_t hdr_len = (tcp[12] >> 4) * 4u;
     if (hdr_len < TCP_HDR || hdr_len > tcp_len) return;
@@ -254,7 +357,10 @@ void VpnTcpConn::deliver(const uint8_t *tcp, size_t tcp_len, uint32_t src_ip_net
     bool fin      = flags & 0x01;
     bool ack_flag = flags & 0x10;
 
-    bool send_ack = false;
+    bool send_ack             = false;
+    bool fast_retx            = false;
+    uint32_t fast_retx_seq    = 0;
+    std::vector<uint8_t> fast_retx_data;
 
     {
         std::lock_guard<std::mutex> lk(mtx_);
@@ -264,8 +370,41 @@ void VpnTcpConn::deliver(const uint8_t *tcp, size_t tcp_len, uint32_t src_ip_net
             rx_eof_       = true;
             connect_done_ = true;
             connect_ok_   = false;
+            stop_retx_    = true;
             cv_.notify_all();
             return;
+        }
+
+        /* Process ACK: drop ACKed segments from retx_q_, detect dup ACKs
+           for fast retransmit, reset RTO when forward progress made. */
+        if (ack_flag && state_ == State::ESTABLISHED) {
+            if (static_cast<int32_t>(ack - snd_una_) > 0) {
+                /* New ACK — advance snd_una_, drop fully-ACKed segments. */
+                snd_una_ = ack;
+                while (!retx_q_.empty() &&
+                       static_cast<int32_t>(
+                           ack - (retx_q_.front().seq +
+                                  retx_q_.front().data.size())) >= 0) {
+                    retx_q_.pop_front();
+                }
+                rto_ms_     = RTO_INITIAL_MS;     /* reset on progress */
+                dup_ack_n_  = 0;
+                last_ack_   = ack;
+                cv_.notify_all();
+            } else if (ack == last_ack_ && !retx_q_.empty()) {
+                /* Duplicate ACK — peer is stuck waiting for missing seq.
+                   On the 3rd dup ACK, fast-retransmit the head segment
+                   without waiting for the RTO. */
+                dup_ack_n_++;
+                if (dup_ack_n_ == FAST_RETX_DUP) {
+                    fast_retx       = true;
+                    fast_retx_seq   = retx_q_.front().seq;
+                    fast_retx_data  = retx_q_.front().data;
+                    retx_q_.front().sent_at = std::chrono::steady_clock::now();
+                    DBG("[tcp] fast-retransmit seq=%u after %d dup ACKs\n",
+                        fast_retx_seq, dup_ack_n_);
+                }
+            }
         }
 
         switch (state_) {
@@ -281,18 +420,40 @@ void VpnTcpConn::deliver(const uint8_t *tcp, size_t tcp_len, uint32_t src_ip_net
             break;
 
         case State::ESTABLISHED:
-            if (data_len > 0 && seq == rcv_nxt_) {
-                rx_buf_.insert(rx_buf_.end(), data, data + data_len);
-                rcv_nxt_ += static_cast<uint32_t>(data_len);
-                send_ack  = true;
-                cv_.notify_all();
+            if (data_len > 0) {
+                int32_t off = static_cast<int32_t>(seq - rcv_nxt_);
+                if (off == 0) {
+                    /* In-order: append and drain any contiguous reorder
+                       entries that now follow. */
+                    rx_buf_.insert(rx_buf_.end(), data, data + data_len);
+                    rcv_nxt_ += static_cast<uint32_t>(data_len);
+                    drain_reorder_();
+                    send_ack = true;
+                    cv_.notify_all();
+                } else if (off > 0 && oo_total_ + data_len <= OO_MAX) {
+                    /* Out-of-order: buffer it.  Send a dup ACK on rcv_nxt_
+                       so the sender knows about the gap. */
+                    if (oo_buf_.find(seq) == oo_buf_.end()) {
+                        oo_buf_.emplace(seq,
+                            std::vector<uint8_t>(data, data + data_len));
+                        oo_total_ += data_len;
+                    }
+                    send_ack = true;
+                } else if (off < 0) {
+                    /* Duplicate (already received) — re-ACK to advance peer. */
+                    send_ack = true;
+                }
+                /* else: gap too large for our reorder buffer; drop & dup-ACK */
             }
             if (fin) {
-                rcv_nxt_++;
-                state_   = State::CLOSE_WAIT;
-                rx_eof_  = true;
-                send_ack = true;
-                cv_.notify_all();
+                /* Only honour FIN if it's at the current rcv_nxt_ (no gaps). */
+                if (seq + data_len == rcv_nxt_) {
+                    rcv_nxt_++;
+                    state_   = State::CLOSE_WAIT;
+                    rx_eof_  = true;
+                    send_ack = true;
+                    cv_.notify_all();
+                }
             }
             break;
 
@@ -310,5 +471,8 @@ void VpnTcpConn::deliver(const uint8_t *tcp, size_t tcp_len, uint32_t src_ip_net
         }
     }
 
+    if (fast_retx)
+        send_segment_seq(0x18, fast_retx_seq,
+                         fast_retx_data.data(), fast_retx_data.size());
     if (send_ack) send_segment(0x10);          /* ACK (called outside lock) */
 }

@@ -31,6 +31,7 @@
  *   SE_PROXY_PORT         — default 1080
  *   SE_VERIFY_CERT        — 0/1, default 1 (validate TLS server cert)
  *   SE_CA_PATH            — dir of hash-named PEMs or single PEM bundle
+ *   SE_UDP_ACCEL          — 0/1, default 1 (use RC4-over-UDP fast path)
  *   SE_TUN_NAME           — default sevpn0
  *   SE_KEEPALIVE          — seconds, default library setting
  *
@@ -346,6 +347,7 @@ int main(int argc, char *argv[]) {
     bool want_proxy      = env_bool("SE_PROXY",      false);
     int  proxy_port      = getenv("SE_PROXY_PORT") ? std::atoi(getenv("SE_PROXY_PORT")) : 1080;
     bool verify_cert     = env_bool("SE_VERIFY_CERT", true);
+    bool use_udp_accel   = env_bool("SE_UDP_ACCEL", true);
     std::string ca_path  = getenv("SE_CA_PATH")  ? getenv("SE_CA_PATH")  : "";
     std::string tun_name = getenv("SE_TUN_NAME") ? getenv("SE_TUN_NAME") : "sevpn0";
     int  keepalive       = getenv("SE_KEEPALIVE") ? std::atoi(getenv("SE_KEEPALIVE")) : 0;
@@ -362,6 +364,7 @@ int main(int argc, char *argv[]) {
             else if (std::strcmp(a, "--debug")      == 0) se_set_debug(1);
             else if (std::strcmp(a, "--default-gw") == 0) want_default_gw = true;
             else if (std::strcmp(a, "--no-verify")  == 0) verify_cert = false;
+            else if (std::strcmp(a, "--no-udp")     == 0) use_udp_accel = false;
             else if (std::strcmp(a, "--ca")         == 0 && i + 1 < argc) ca_path  = argv[++i];
             else if (std::strcmp(a, "--tun")        == 0 && i + 1 < argc) tun_name = argv[++i];
             else if (std::strcmp(a, "--keepalive")  == 0 && i + 1 < argc) keepalive = std::atoi(argv[++i]);
@@ -398,6 +401,7 @@ int main(int argc, char *argv[]) {
 
     /* Apply runtime config to the library. */
     se_set_verify_cert(verify_cert ? 1 : 0);
+    se_set_use_udp_accel(use_udp_accel ? 1 : 0);
     if (!ca_path.empty()) se_set_ca_path(ca_path.c_str());
     if (keepalive > 0)    se_set_keepalive(keepalive);
 

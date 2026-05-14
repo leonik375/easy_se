@@ -450,7 +450,9 @@ bool Tunnel::authenticate(const std::string &hub,
     uint8_t udp_my_key[20]{}, udp_my_key_v2[128]{}, udp_init_iv[20]{};
     uint16_t udp_client_port = 0;
 
-    int udp_fd = ::socket(AF_INET, SOCK_DGRAM, 0);
+    int udp_fd = vpn_use_udp_accel() ? ::socket(AF_INET, SOCK_DGRAM, 0) : -1;
+    if (!vpn_use_udp_accel())
+        fprintf(stderr, "[udp] acceleration disabled by caller\n");
     if (udp_fd >= 0) {
         RAND_bytes(udp_my_key,    sizeof(udp_my_key));
         RAND_bytes(udp_my_key_v2, sizeof(udp_my_key_v2));
