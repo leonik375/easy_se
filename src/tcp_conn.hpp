@@ -114,7 +114,7 @@ private:
         int                                   retx_count = 0;
     };
     std::deque<RetxSeg> retx_q_;
-    int                 rto_ms_     = 200;          /* RTO; doubles on loss */
+    int                 rto_ms_     = 500;          /* RTO; doubles on loss */
     int                 dup_ack_n_  = 0;            /* fast-retransmit counter */
     uint32_t            last_ack_   = 0;            /* most recent ACK seen   */
     std::thread         retx_thread_;
@@ -130,7 +130,7 @@ private:
        loop's tcp_demux_deliver. */
     std::once_flag      unregister_once_;
 
-    static constexpr int RTO_INITIAL_MS = 200;      /* aggressive for lossy paths */
+    static constexpr int RTO_INITIAL_MS = 500;      /* matches typical VPN RTT; avoids spurious retx */
     static constexpr int RTO_MAX_MS     = 32000;
     static constexpr int RETX_MAX_TRIES = 6;        /* ~ RTO * (1+2+4+8+16+32) */
     static constexpr int FAST_RETX_DUP  = 3;
