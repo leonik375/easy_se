@@ -210,7 +210,9 @@ bool VpnTcpConn::connect(uint32_t dst_ip_net, uint16_t dst_port, int timeout_ms)
     vpn_probe_arp(gw, 0); /* fire-and-forget: kick the ARP request, don't block */
 
     state_ = State::SYN_SENT;
-    vpn_tcp_register(local_port_, this); /* register before sending SYN */
+    /* Register a weak_ptr so the recv loop can hold the conn alive
+       during deliver() without keeping the demux mutex. */
+    vpn_tcp_register(local_port_, shared_from_this());
 
     send_segment(0x02);  /* SYN — counts as one sequence byte */
     snd_nxt_++;
@@ -273,10 +275,14 @@ bool VpnTcpConn::send(const void *buf, size_t len) {
         send_segment_seq(0x18, seq, data.data(), chunk); /* PSH+ACK */
         snd_nxt_ += static_cast<uint32_t>(chunk);
 
-        /* Queue for potential retransmit until ACKed. */
+        /* Queue for potential retransmit until ACKed.  Only notify when
+           we add to an empty queue — if entries were already there, the
+           retx thread is sleeping on the head's deadline, and new tail
+           entries don't change that deadline. */
+        bool was_empty = retx_q_.empty();
         retx_q_.push_back({seq, std::move(data),
                           std::chrono::steady_clock::now(), 0});
-        cv_.notify_all();   /* wake retx thread to set/refresh its timer */
+        if (was_empty) cv_.notify_one();
 
         lk.unlock();
         p   += chunk;

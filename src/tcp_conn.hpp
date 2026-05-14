@@ -32,7 +32,7 @@
      ssize_t n = c.recv(buf, sizeof(buf));
      c.close();
 */
-class VpnTcpConn {
+class VpnTcpConn : public std::enable_shared_from_this<VpnTcpConn> {
 public:
     VpnTcpConn()  = default;
     ~VpnTcpConn() { close(); }

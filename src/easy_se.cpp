@@ -83,9 +83,12 @@ static constexpr size_t PENDING_MAX_TOTAL  = 128;
 static constexpr int    PENDING_TIMEOUT_MS = 2000;
 static size_t           g_pending_arp_total = 0;
 
-/* TCP demux: local port → VpnTcpConn for userspace proxy connections. */
+/* TCP demux: local port → VpnTcpConn for userspace proxy connections.
+   Stored as weak_ptrs so the recv loop can lock() one to a shared_ptr,
+   release the demux mutex, and call deliver() without serialising lookups
+   for other connections. */
 static std::mutex g_tcp_demux_mutex;
-static std::unordered_map<uint16_t, VpnTcpConn*> g_tcp_demux;
+static std::unordered_map<uint16_t, std::weak_ptr<VpnTcpConn>> g_tcp_demux;
 
 /* Forward decl — defined after vpn_send_frame() is known. */
 static void arp_queue_drain(uint32_t ip_net, const uint8_t *mac);
@@ -368,9 +371,9 @@ static void arp_queue_drain(uint32_t ip_net, const uint8_t *mac) {
     }
 }
 
-void vpn_tcp_register(uint16_t port, VpnTcpConn *conn) {
+void vpn_tcp_register(uint16_t port, std::shared_ptr<VpnTcpConn> conn) {
     std::lock_guard<std::mutex> lk(g_tcp_demux_mutex);
-    g_tcp_demux[port] = conn;
+    g_tcp_demux[port] = std::move(conn);
 }
 
 void vpn_tcp_unregister(uint16_t port) {
@@ -417,17 +420,26 @@ static bool tcp_demux_deliver(const uint8_t *frame, size_t len) {
     uint32_t src_ip_net;
     memcpy(&src_ip_net, ip + 12, 4);
 
-    /* Hold the mutex through deliver() to prevent use-after-free and to
-       reject frames whose src_ip doesn't match the registered connection
-       (port reuse between TUN connections and proxy VpnTcpConn). */
+    /* Lookup → take a strong ref → release demux mutex → deliver.
+       Holding the mutex through deliver() would serialise the recv path
+       across every active VpnTcpConn (chokepoint under proxy load).
+       The weak_ptr → shared_ptr promotion keeps the conn alive for the
+       duration of deliver() even if a bridge thread calls close() and
+       drops its own refs concurrently. */
+    std::shared_ptr<VpnTcpConn> conn;
     {
         std::lock_guard<std::mutex> lk(g_tcp_demux_mutex);
         auto it = g_tcp_demux.find(dst_port);
         if (it == g_tcp_demux.end()) return false;
-        VpnTcpConn *conn = it->second;
-        if (conn->remote_ip_net() != src_ip_net) return false;
-        conn->deliver(tcp, tcp_seg_len, src_ip_net);
+        conn = it->second.lock();
+        if (!conn) {
+            /* Stale entry — the conn was destroyed; clean up. */
+            g_tcp_demux.erase(it);
+            return false;
+        }
     }
+    if (conn->remote_ip_net() != src_ip_net) return false;
+    conn->deliver(tcp, tcp_seg_len, src_ip_net);
     return true;
 }
 

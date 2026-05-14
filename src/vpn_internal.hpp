@@ -1,6 +1,7 @@
 #pragma once
 #include <cstdint>
 #include <cstddef>
+#include <memory>
 
 class VpnTcpConn;
 
@@ -21,9 +22,11 @@ bool vpn_lookup_mac(uint32_t ip_net, uint8_t *mac_out);
 bool vpn_send_frame(const uint8_t *eth, size_t len);
 
 /* TCP demux: register/unregister a VpnTcpConn by its local port.
-   The recv loop calls deliver() on registered connections when a matching
-   TCP segment arrives addressed to our VPN IP. */
-void vpn_tcp_register  (uint16_t port, VpnTcpConn *conn);
+   The map holds weak_ptrs so the recv loop's tcp_demux_deliver can
+   release the demux mutex *before* calling conn->deliver() — without
+   that, slow deliver() on one connection serialises lookups for all
+   the others (chokepoint under parallel proxy load). */
+void vpn_tcp_register  (uint16_t port, std::shared_ptr<VpnTcpConn> conn);
 void vpn_tcp_unregister(uint16_t port);
 
 /* Send an ARP request for ip_net and poll until the recv loop processes the
