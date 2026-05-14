@@ -67,8 +67,20 @@
 
 static int g_tun_fd = -1;
 
-static void on_signal(int) {
-    printf("\nDisconnecting…\n");
+static void on_signal(int sig) {
+    /* printf is NOT async-signal-safe; write(2, …) is.  Use a fixed-size
+       buffer + manual int formatting so we can identify which signal is
+       responsible for the otherwise-silent clean exits we keep seeing. */
+    char  buf[64];
+    char *p = buf;
+    const char *prefix = "\n[signal] received ";
+    while (*prefix) *p++ = *prefix++;
+    int v = sig, d = 100;
+    if (v >= 100) { *p++ = '0' + v / 100; v %= 100; d = 10; }
+    if (v >=  10 || d == 10) { *p++ = '0' + v / 10;  v %= 10; }
+    *p++ = '0' + v;
+    *p++ = '\n';
+    (void)write(2, buf, p - buf);
     se_disconnect();
 }
 
@@ -470,6 +482,12 @@ int main(int argc, char *argv[]) {
 
     signal(SIGINT,  on_signal);
     signal(SIGTERM, on_signal);
+    signal(SIGHUP,  on_signal);
+    /* SIGPIPE is the most common cause of silent-clean-exit: the proxy
+       bridges write to socketpairs whose other end may have closed.
+       Ignore it process-wide — affected sends will just return EPIPE
+       and the bridge thread handles that locally. */
+    signal(SIGPIPE, SIG_IGN);
 
     printf("Forwarding. SIGINT/SIGTERM to disconnect.\n");
     rc = se_run(g_tun_fd);
