@@ -1,0 +1,14 @@
+#!/usr/bin/make -f
+# debhelper rules — drives the cmake buildsystem.
+
+%:
+	dh $@ --buildsystem=cmake
+
+override_dh_auto_configure:
+	dh_auto_configure -- \
+	    -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+	    -DCMAKE_INSTALL_PREFIX=/usr
+
+# No automated tests — easy_se_cli is the only harness and needs root + TUN.
+override_dh_auto_test:
+	:

@@ -31,8 +31,28 @@ int se_run(int tun_fd);
 /* Signal disconnect from any thread. Safe to call from signal handler. */
 void se_disconnect(void);
 
+/* Interrupt the current TLS session and force the reconnect loop to fire
+   immediately.  Useful when the platform layer detects an underlying-network
+   change (e.g. Wi-Fi → cellular handoff) and doesn't want to wait for the
+   TCP read timeout to notice the dead socket.  Has no effect if no session
+   is currently established or if se_disconnect() has been called. */
+void se_force_reconnect(void);
+
 /* Enable/disable verbose debug logging to stderr (default: off). */
 void se_set_debug(int enable);
+
+/* Enable TLS server-certificate validation (default: 1 = enabled).
+   When enabled, the server cert is validated against the configured CA store
+   AND the certificate's hostname is matched against the connect host.
+   When disabled, any certificate is accepted (legacy SoftEther behaviour;
+   trivially MITM-able by an on-path attacker). Per-profile toggle. */
+void se_set_verify_cert(int enable);
+
+/* Set the CA store used for cert validation.  Pass a directory of OpenSSL
+   hash-named PEM files (e.g. Android's "/system/etc/security/cacerts"),
+   a single PEM bundle file, or NULL/"" to fall back to OpenSSL's compiled-in
+   default search paths.  Has no effect when verify_cert is disabled. */
+void se_set_ca_path(const char *path);
 
 /* Set keepalive interval on the TCP channel (default: 15 s).
    Call before se_run(). */

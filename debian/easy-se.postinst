@@ -1,0 +1,18 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    configure)
+        # /etc/easy-se holds the shipped example.conf (conffile, 0644) plus
+        # user-created <profile>.conf and <profile>.pass.  Directory is
+        # world-readable so users can `cp example.conf my.conf` without
+        # sudo just to ls; secrecy lives at the per-file level (0600 on
+        # any file containing SE_PASS, enforced by easy_se's PASS_FILE
+        # reader).
+        install -d -m 0755 /etc/easy-se
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

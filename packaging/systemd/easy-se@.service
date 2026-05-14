@@ -1,0 +1,77 @@
+# Template unit — one instance per VPN profile.
+#
+# Install:
+#   sudo install -m 0644 packaging/systemd/easy-se@.service \
+#       /etc/systemd/system/easy-se@.service
+#   sudo install -m 0755 build/easy_se_cli /usr/local/bin/easy_se_cli
+#   sudo mkdir -p /etc/easy-se && sudo chmod 0750 /etc/easy-se
+#   sudo install -m 0600 packaging/conf.d/example.conf \
+#       /etc/easy-se/<profile>.conf
+#   sudoedit /etc/easy-se/<profile>.conf
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now easy-se@<profile>.service
+#
+# Logs:
+#   journalctl -u easy-se@<profile>.service -f
+#
+# The %i specifier is replaced with the instance name, so each profile gets
+# its own config file at /etc/easy-se/<profile>.conf.
+
+[Unit]
+Description=easy_se VPN client (%i)
+Documentation=https://github.com/leonik375/easy_se
+After=network-online.target nss-lookup.target
+Wants=network-online.target
+# Crash-loop guard — fail hard if the service restarts 10 times in 10 minutes.
+StartLimitIntervalSec=600
+StartLimitBurst=10
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/easy-se/%i.conf
+
+# Read password from a file with 0600 perms — keeps the secret out of the
+# unit file and out of /proc/<pid>/environ.  Comment out and set SE_PASS in
+# the config file if you prefer.
+LoadCredential=easy-se-pass:/etc/easy-se/%i.pass
+Environment=SE_PASS_FILE=%d/easy-se-pass
+
+ExecStart=/usr/local/bin/easy_se_cli
+
+# Auto-restart with exponential-ish backoff.  StartLimit* prevents a tight
+# crash loop if the server is permanently unreachable.
+Restart=on-failure
+RestartSec=10
+
+# Clean shutdown — easy_se traps SIGTERM and tears down the tunnel + routes.
+KillSignal=SIGTERM
+TimeoutStopSec=15
+
+# --- Hardening (works as root; opening /dev/net/tun needs CAP_NET_ADMIN) ---
+# To run as a dedicated user instead, create one and use the commented
+# AmbientCapabilities below; you'll also need to relax ProtectSystem so the
+# user can write to /etc/resolv.conf if you don't use systemd-resolved.
+# User=easy-se
+# Group=easy-se
+# AmbientCapabilities=CAP_NET_ADMIN
+# CapabilityBoundingSet=CAP_NET_ADMIN
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+# easy_se uses /dev/net/tun and netlink for route changes; allow both.
+DeviceAllow=/dev/net/tun rw
+RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK AF_UNIX
+ReadWritePaths=/etc/resolv.conf
+
+[Install]
+WantedBy=multi-user.target

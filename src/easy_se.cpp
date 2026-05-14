@@ -35,6 +35,9 @@ static int              g_keepalive_sec     = 60;
 static std::string      g_static_ip, g_static_gw, g_static_dns;
 static int              g_static_prefix     = 24;
 static std::atomic<int> g_skip_default_gw{0};
+static std::atomic<int> g_verify_cert{1};   /* default ON: secure by default */
+static std::mutex       g_ca_path_mutex;
+static std::string      g_ca_path;
 
 #define DBG(...) do { if (g_debug) fprintf(stderr, __VA_ARGS__); } while(0)
 
@@ -333,7 +336,13 @@ static bool tcp_demux_deliver(const uint8_t *frame, size_t len) {
 static int do_connect(se_ip_info_t *ip_out) {
     arp_cache_clear();
 
-    if (!g_tunnel.connect(g_host.c_str(), g_port))                              return -1;
+    std::string ca_path;
+    {
+        std::lock_guard<std::mutex> lk(g_ca_path_mutex);
+        ca_path = g_ca_path;
+    }
+    if (!g_tunnel.connect(g_host.c_str(), g_port,
+                          g_verify_cert.load() != 0, ca_path))                  return -1;
     if (!g_tunnel.handshake())                                                   return -2;
     if (!g_tunnel.authenticate(g_hub.c_str(), g_user_str.c_str(),
                                g_pass.c_str(), g_authtype))                      return -3;
@@ -555,6 +564,13 @@ void se_disconnect() {
     g_tunnel.interrupt();
 }
 
+void se_force_reconnect(void) {
+    /* Don't touch g_user_stop — that would prevent the reconnect loop from
+       running.  Just interrupt the current tunnel so the recv loop returns
+       and the backoff retry path kicks in. */
+    g_tunnel.interrupt();
+}
+
 void se_set_debug(int enable) {
     g_debug = (enable != 0);
 }
@@ -579,6 +595,13 @@ void se_set_static_ip(const char *ip, int prefix, const char *gw, const char *dn
 
 void se_set_skip_default_gw(int skip) { g_skip_default_gw.store(skip != 0 ? 1 : 0); }
 int  se_get_skip_default_gw(void)    { return g_skip_default_gw.load(); }
+
+void se_set_verify_cert(int enable) { g_verify_cert.store(enable != 0 ? 1 : 0); }
+
+void se_set_ca_path(const char *path) {
+    std::lock_guard<std::mutex> lk(g_ca_path_mutex);
+    g_ca_path = path ? path : "";
+}
 
 static ProxyServer g_proxy;
 int  se_proxy_start(int port) {

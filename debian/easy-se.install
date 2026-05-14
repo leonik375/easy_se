@@ -1,0 +1,3 @@
+packaging/systemd/easy-se@.service     lib/systemd/system
+packaging/conf.d/example.conf          etc/easy-se
+packaging/README.md                    usr/share/doc/easy-se

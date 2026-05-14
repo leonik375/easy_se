@@ -24,8 +24,13 @@ public:
     Tunnel(const Tunnel &)            = delete;
     Tunnel &operator=(const Tunnel &) = delete;
 
-    /* Phase 1: TLS connect */
-    bool connect(const std::string &host, int port);
+    /* Phase 1: TLS connect.
+       verify_cert: when true, validate the peer cert against ca_path (a dir
+       of hash-named PEMs, a PEM bundle file, or empty → OpenSSL defaults)
+       and match the cert's hostname against `host`. */
+    bool connect(const std::string &host, int port,
+                 bool verify_cert = true,
+                 const std::string &ca_path = "");
 
     /* Phase 2: send watermark, receive server random[20] */
     bool handshake();

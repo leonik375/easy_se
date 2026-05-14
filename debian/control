@@ -1,0 +1,35 @@
+Source: easy-se
+Section: net
+Priority: optional
+Maintainer: Leonid <leonik.eut@gmail.com>
+Build-Depends:
+ debhelper-compat (= 13),
+ cmake (>= 3.22),
+ libssl-dev,
+ pkg-config,
+Standards-Version: 4.6.2
+Homepage: https://github.com/leonik375/easy_se
+Vcs-Git: https://github.com/leonik375/easy_se.git
+Vcs-Browser: https://github.com/leonik375/easy_se
+Rules-Requires-Root: no
+
+Package: easy-se
+Architecture: any
+Depends:
+ ${shlibs:Depends},
+ ${misc:Depends},
+Recommends: systemd
+Description: SoftEther VPN client (Cedar protocol over TLS)
+ A minimal SoftEther VPN client that speaks the Cedar wire protocol
+ directly over TLS.  Provides:
+ .
+   * easy_se_cli — a CLI/daemon that opens a TUN device, runs DHCP over
+     the SoftEther Ethernet tunnel, and forwards packets between the
+     kernel and the server.
+   * A systemd template unit (easy-se@.service) so one instance per
+     VPN profile can be enabled with systemctl enable easy-se@<name>.
+   * KEY=VALUE config files in /etc/easy-se/<profile>.conf compatible
+     with systemd EnvironmentFile=.
+ .
+ TLS server-certificate validation is enabled by default; the binary
+ uses the system CA store via /etc/ssl/certs.

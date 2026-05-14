@@ -1,0 +1,9 @@
+easy-se (0.1.0-1) unstable; urgency=medium
+
+  * Initial release.
+  * easy_se_cli with KEY=VALUE config + SE_* env var support.
+  * systemd template unit easy-se@.service with LoadCredential= for the
+    profile password.
+  * TLS server-cert validation enabled by default (system CA store).
+
+ -- Leonid <leonik.eut@gmail.com>  Wed, 13 May 2026 00:00:00 +0000

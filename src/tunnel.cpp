@@ -7,6 +7,7 @@
 #include <netdb.h>
 #include <netinet/tcp.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -20,6 +21,7 @@
 
 #include <openssl/ssl.h>
 #include <openssl/err.h>
+#include <openssl/x509v3.h>
 #include <openssl/sha.h>
 #include <openssl/rand.h>
 
@@ -303,7 +305,8 @@ std::optional<Pack> Tunnel::pack_recv() {
    Connection / handshake / auth
    ------------------------------------------------------------------------- */
 
-bool Tunnel::connect(const std::string &host, int port) {
+bool Tunnel::connect(const std::string &host, int port,
+                     bool verify_cert, const std::string &ca_path) {
     host_ = host;
 
     /* Resolve */
@@ -323,16 +326,46 @@ bool Tunnel::connect(const std::string &host, int port) {
     int one = 1;
     setsockopt(fd_, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
 
-    /* TLS — accept any certificate (server cert validation is left to caller) */
     SSL_library_init();
     ctx_ = SSL_CTX_new(TLS_client_method());
     if (!ctx_) return false;
-    SSL_CTX_set_verify(ctx_, SSL_VERIFY_NONE, nullptr);
+
+    if (verify_cert) {
+        SSL_CTX_set_verify(ctx_, SSL_VERIFY_PEER, nullptr);
+
+        /* Load CA store.  ca_path may be a directory (Android system store),
+           a single PEM bundle, or empty (→ OpenSSL compiled-in defaults). */
+        bool loaded = false;
+        if (!ca_path.empty()) {
+            struct ::stat st{};
+            if (::stat(ca_path.c_str(), &st) == 0) {
+                if (S_ISDIR(st.st_mode))
+                    loaded = SSL_CTX_load_verify_locations(
+                        ctx_, nullptr, ca_path.c_str()) == 1;
+                else
+                    loaded = SSL_CTX_load_verify_locations(
+                        ctx_, ca_path.c_str(), nullptr) == 1;
+            }
+        }
+        if (!loaded)
+            SSL_CTX_set_default_verify_paths(ctx_);
+    } else {
+        SSL_CTX_set_verify(ctx_, SSL_VERIFY_NONE, nullptr);
+    }
 
     ssl_ = SSL_new(ctx_);
     if (!ssl_) return false;
     SSL_set_fd(ssl_, fd_);
     SSL_set_tlsext_host_name(ssl_, host.c_str());
+
+    if (verify_cert) {
+        /* Match the cert's CN/SAN against the connect host.  Without this the
+           CA validation alone is insufficient — any cert signed by any trusted
+           CA for any hostname would be accepted. */
+        SSL_set_hostflags(ssl_, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
+        if (SSL_set1_host(ssl_, host.c_str()) != 1) return false;
+    }
+
     return SSL_connect(ssl_) == 1;
 }
 

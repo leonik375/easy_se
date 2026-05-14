@@ -1,0 +1,206 @@
+name: Release
+
+# Triggered on tag pushes like v0.1.0, v1.2.3.  The leading "v" is
+# stripped before being written into the Debian changelog and CMake
+# version, so the package version stays canonical (semver/PEP-440-ish).
+#
+# Manual triggers (workflow_dispatch) build the same matrix without
+# attaching artifacts to a Release — useful for verifying packaging
+# changes before tagging.
+
+on:
+  push:
+    tags: ['v*']
+    # Test branches build the matrix end-to-end (deb + static tarball)
+    # but skip the publish-release job (gated on the v* tag prefix below).
+    branches: ['ci/**', 'test/**']
+  workflow_dispatch:
+
+jobs:
+  # ────────────────────── Debian / Ubuntu .deb builds ──────────────────────
+  deb:
+    name: deb-${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.container }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: debian-bookworm-amd64
+            runner: ubuntu-24.04
+            container: debian:bookworm
+          - target: debian-bookworm-arm64
+            runner: ubuntu-24.04-arm
+            container: debian:bookworm
+          - target: ubuntu-jammy-amd64
+            runner: ubuntu-24.04
+            container: ubuntu:22.04
+
+    steps:
+      - name: Install build deps
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ca-certificates git \
+            build-essential cmake pkg-config \
+            debhelper devscripts dh-make fakeroot \
+            libssl-dev
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # need full history for tags
+
+      - name: Trust workspace
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      # Derive version from tag (refs/tags/v0.1.2 → 0.1.2).  For manual
+      # workflow_dispatch runs use the baseline from debian/changelog.
+      - name: Compute version
+        id: ver
+        run: |
+          if [ "${GITHUB_REF#refs/tags/v}" != "$GITHUB_REF" ]; then
+              echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+          else
+              echo "version=0.0.0+ci$(date +%Y%m%d%H%M%S)" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Rewrite debian/changelog with the actual release version.
+      # Done in plain shell (no dch) so the job doesn't pull in devscripts'
+      # libdistro-info-perl just to format one entry.
+      - name: Pin package version
+        run: |
+          V="${{ steps.ver.outputs.version }}"
+          cat > debian/changelog <<EOF
+          easy-se ($V-1) unstable; urgency=medium
+
+            * Release $V (built by CI).
+
+           -- easy_se release bot <releases@example.invalid>  $(date -R)
+          EOF
+          head debian/changelog
+
+      - name: Build .deb
+        run: dpkg-buildpackage -us -uc -b
+
+      # dpkg-buildpackage drops artefacts in the parent dir.
+      - name: Stage artefacts
+        run: |
+          mkdir -p artefacts
+          cp ../easy-se_*.deb     artefacts/
+          cp ../easy-se_*.buildinfo artefacts/ || true
+          cp ../easy-se_*.changes artefacts/ || true
+          ls -la artefacts/
+
+      - name: Upload artefacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: deb-${{ matrix.target }}
+          path: artefacts/
+
+  # ────────────────────── Static (musl) tarball ──────────────────────
+  static:
+    name: static-${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    container: alpine:3.20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+
+    steps:
+      - name: Install build deps
+        run: |
+          apk add --no-cache \
+            build-base cmake linux-headers git \
+            openssl-dev openssl-libs-static
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Trust workspace
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Compute version
+        id: ver
+        run: |
+          if [ "${GITHUB_REF#refs/tags/v}" != "$GITHUB_REF" ]; then
+              echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+          else
+              echo "version=0.0.0+ci$(date +%Y%m%d%H%M%S)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Configure (static)
+        run: |
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DEASY_SE_STATIC_CLI=ON \
+            -DOPENSSL_USE_STATIC_LIBS=TRUE
+
+      - name: Build
+        run: cmake --build build -j$(nproc)
+
+      - name: Verify static linkage
+        run: |
+          # `file` is reliable across libc implementations.  musl ldd prints
+          # "Not a valid dynamic program" for static binaries with mixed
+          # casing, which is fiddly to grep — use `file` instead.
+          info=$(file build/easy_se_cli)
+          echo "$info"
+          if echo "$info" | grep -q 'statically linked'; then
+              echo "OK: static"
+          else
+              echo "FAIL: binary is dynamically linked"
+              ldd build/easy_se_cli || true
+              exit 1
+          fi
+
+      - name: Stage tarball
+        run: |
+          V="${{ steps.ver.outputs.version }}"
+          D="easy_se-$V-linux-${{ matrix.arch }}-static"
+          mkdir -p "$D"
+          cp build/easy_se_cli           "$D/"
+          cp packaging/systemd/easy-se@.service "$D/"
+          cp packaging/conf.d/example.conf      "$D/"
+          cp packaging/README.md                "$D/"
+          tar -czvf "$D.tar.gz" "$D"
+          ls -la "$D.tar.gz"
+
+      - name: Upload tarball
+        uses: actions/upload-artifact@v4
+        with:
+          name: static-${{ matrix.arch }}
+          path: easy_se-*-linux-*-static.tar.gz
+
+  # ────────────────────── GitHub Release ──────────────────────
+  release:
+    name: Publish release
+    needs: [deb, static]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artefacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: List artefacts
+        run: find dist -type f | sort
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            dist/**/*.deb
+            dist/**/*.tar.gz

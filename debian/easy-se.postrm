@@ -1,0 +1,16 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    purge)
+        # Only remove the config tree on purge — and only if it's empty,
+        # so we don't blow away the user's profiles.
+        if [ -d /etc/easy-se ]; then
+            rmdir --ignore-fail-on-non-empty /etc/easy-se || true
+        fi
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

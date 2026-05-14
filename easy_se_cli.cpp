@@ -1,21 +1,46 @@
 /* easy_se_cli.cpp — Linux CLI for the easy_se library.
  *
  * Usage (as root or with CAP_NET_ADMIN):
- *   ./easy_se <host> <port> <hub> <user> <pass> [options]
+ *   ./easy_se_cli <host> <port> <hub> <user> <pass> [options]
+ *   ./easy_se_cli --config /etc/easy-se/myvpn.conf [options]
+ *   ./easy_se_cli                                  # all settings via env
  *
  * Options:
+ *   --config <path> KEY=VALUE config file (same format as systemd EnvironmentFile)
  *   --radius        use plaintext auth (local + RADIUS)
  *   --debug         verbose easy_se logging
  *   --default-gw    add default route through VPN (+ protect server route)
  *   --proxy [port]  start HTTP/SOCKS5 proxy (default port 1080, 0=auto)
+ *   --no-verify     disable TLS server-cert validation (insecure)
+ *   --ca <path>     CA bundle/dir for cert validation (default: system store)
+ *
+ * Configuration precedence (later overrides earlier):
+ *   1. --config file (if given)
+ *   2. SE_* environment variables
+ *   3. command-line arguments
+ *
+ * Environment variables / config keys (SE_ prefix):
+ *   SE_HOST, SE_PORT (443), SE_HUB (DEFAULT), SE_USER,
+ *   SE_PASS               — password literal
+ *   SE_PASS_FILE          — read password from file (preferred for secrets;
+ *                           works with systemd's LoadCredential=)
+ *   SE_AUTH               — "password" (default) | "radius"
+ *   SE_DEBUG              — 0/1
+ *   SE_DEFAULT_GW         — 0/1, install default route via VPN
+ *   SE_PROXY              — 0/1, start HTTP/SOCKS5 proxy
+ *   SE_PROXY_PORT         — default 1080
+ *   SE_VERIFY_CERT        — 0/1, default 1 (validate TLS server cert)
+ *   SE_CA_PATH            — dir of hash-named PEMs or single PEM bundle
+ *   SE_TUN_NAME           — default sevpn0
+ *   SE_KEEPALIVE          — seconds, default library setting
  *
  * What it does:
  *   1. se_connect() — TLS, handshake, auth, DHCP probe
  *   2. Prints the assigned IP info
- *   3. Opens a Linux TUN device (sevpn0)
+ *   3. Opens a Linux TUN device (sevpn0 by default)
  *   4. Configures the interface; optionally sets default route
  *   5. Optionally starts the built-in proxy
- *   6. se_run() — forwards packets until Ctrl-C
+ *   6. se_run() — forwards packets until SIGINT/SIGTERM
  */
 
 #include <cstdio>
@@ -23,11 +48,14 @@
 #include <cstring>
 #include <csignal>
 #include <cerrno>
+#include <string>
+#include <fstream>
 
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <net/if.h>
 #include <netdb.h>
 #include <linux/if_tun.h>
@@ -211,35 +239,167 @@ static bool resolve_host(const char *host, uint32_t *ip_net) {
     return true;
 }
 
+/* ── config / env loader ────────────────────────────────────────────── */
+
+/* Trim whitespace and optional surrounding "..."/'...' quotes. */
+static std::string cfg_trim(std::string s) {
+    auto issp = [](unsigned char c){ return std::isspace(c) != 0; };
+    while (!s.empty() && issp(s.front())) s.erase(s.begin());
+    while (!s.empty() && issp(s.back()))  s.pop_back();
+    if (s.size() >= 2 &&
+        ((s.front() == '"'  && s.back() == '"') ||
+         (s.front() == '\'' && s.back() == '\'')))
+        s = s.substr(1, s.size() - 2);
+    return s;
+}
+
+/* Read a systemd-EnvironmentFile-style KEY=VALUE config and setenv() each
+   entry.  Existing env values are NOT overridden — env wins, so a user can
+   override a config-file value by exporting the same variable. */
+static bool load_config_into_env(const char *path) {
+    std::ifstream f(path);
+    if (!f) {
+        fprintf(stderr, "config: cannot open %s: %s\n", path, strerror(errno));
+        return false;
+    }
+    std::string line; int n = 0;
+    while (std::getline(f, line)) {
+        ++n;
+        std::string s = cfg_trim(line);
+        if (s.empty() || s[0] == '#' || s[0] == ';') continue;
+        auto eq = s.find('=');
+        if (eq == std::string::npos) {
+            fprintf(stderr, "config %s:%d: no '=' — ignored\n", path, n);
+            continue;
+        }
+        std::string k = cfg_trim(s.substr(0, eq));
+        std::string v = cfg_trim(s.substr(eq + 1));
+        setenv(k.c_str(), v.c_str(), 0);   /* 0 = don't override existing */
+    }
+    return true;
+}
+
+/* Refuses world/group-readable secret files to catch mistakes early. */
+static std::string read_pass_file(const char *path) {
+    struct stat st{};
+    if (::stat(path, &st) != 0) {
+        fprintf(stderr, "SE_PASS_FILE %s: %s\n", path, strerror(errno));
+        return "";
+    }
+    if (st.st_mode & (S_IRWXG | S_IRWXO)) {
+        fprintf(stderr, "SE_PASS_FILE %s: refusing — group/other-readable (mode %o)\n",
+                path, st.st_mode & 0777);
+        return "";
+    }
+    std::ifstream f(path);
+    std::string p; std::getline(f, p);
+    return p;
+}
+
+static bool env_bool(const char *k, bool def) {
+    const char *v = getenv(k);
+    if (!v || !*v) return def;
+    return std::strcmp(v, "1") == 0 || std::strcmp(v, "true") == 0 ||
+           std::strcmp(v, "yes") == 0 || std::strcmp(v, "on")   == 0;
+}
+
 /* ── main ────────────────────────────────────────────────────────────── */
 
 int main(int argc, char *argv[]) {
-    if (argc < 6) {
-        fprintf(stderr, "Usage: %s <host> <port> <hub> <user> <pass> [--radius] [--debug] [--default-gw] [--proxy [port]]\n", argv[0]);
+    /* Line-buffer stdout so journalctl flushes per-line under systemd. */
+    setvbuf(stdout, nullptr, _IOLBF, 0);
+
+    /* Pass 1: --config (lowest precedence; populates env without overriding
+       anything the caller already exported). */
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--config") == 0 && i + 1 < argc) {
+            if (!load_config_into_env(argv[++i])) return 1;
+        } else if (std::strcmp(argv[i], "-h") == 0 ||
+                   std::strcmp(argv[i], "--help") == 0) {
+            fprintf(stderr,
+                "Usage: %s <host> <port> <hub> <user> <pass> [options]\n"
+                "       %s --config /path/to/easy-se.conf [options]\n"
+                "       %s         # all settings via SE_* env vars\n"
+                "Options: --radius --debug --default-gw --proxy [port]\n"
+                "         --no-verify --ca <path> --tun <name> --keepalive <s>\n"
+                "         --config <path>\n"
+                "See easy_se_cli.cpp header for SE_* env var names.\n",
+                argv[0], argv[0], argv[0]);
+            return 0;
+        }
+    }
+
+    /* Seed positional values from env (overridden by argv positionals below). */
+    std::string s_host = getenv("SE_HOST") ? getenv("SE_HOST") : "";
+    std::string s_hub  = getenv("SE_HUB")  ? getenv("SE_HUB")  : "DEFAULT";
+    std::string s_user = getenv("SE_USER") ? getenv("SE_USER") : "";
+    std::string s_pass = getenv("SE_PASS") ? getenv("SE_PASS") : "";
+    if (s_pass.empty() && getenv("SE_PASS_FILE"))
+        s_pass = read_pass_file(getenv("SE_PASS_FILE"));
+    int port = getenv("SE_PORT") ? std::atoi(getenv("SE_PORT")) : 443;
+
+    int  authtype = (getenv("SE_AUTH") &&
+                     (std::strcmp(getenv("SE_AUTH"), "radius") == 0 ||
+                      std::strcmp(getenv("SE_AUTH"), "plain")  == 0))
+                  ? SE_AUTH_PLAIN_PASSWORD : SE_AUTH_PASSWORD;
+    bool want_default_gw = env_bool("SE_DEFAULT_GW", false);
+    bool want_proxy      = env_bool("SE_PROXY",      false);
+    int  proxy_port      = getenv("SE_PROXY_PORT") ? std::atoi(getenv("SE_PROXY_PORT")) : 1080;
+    bool verify_cert     = env_bool("SE_VERIFY_CERT", true);
+    std::string ca_path  = getenv("SE_CA_PATH")  ? getenv("SE_CA_PATH")  : "";
+    std::string tun_name = getenv("SE_TUN_NAME") ? getenv("SE_TUN_NAME") : "sevpn0";
+    int  keepalive       = getenv("SE_KEEPALIVE") ? std::atoi(getenv("SE_KEEPALIVE")) : 0;
+    if (env_bool("SE_DEBUG", false)) se_set_debug(1);
+
+    /* Pass 2: positional args + flags.  Positional fill in any of the five
+       core fields that env didn't supply; explicit argv values always win. */
+    int pos = 0;
+    for (int i = 1; i < argc; ++i) {
+        const char *a = argv[i];
+        if (a[0] == '-' && a[1] == '-') {
+            if      (std::strcmp(a, "--config")     == 0) ++i;
+            else if (std::strcmp(a, "--radius")     == 0) authtype = SE_AUTH_PLAIN_PASSWORD;
+            else if (std::strcmp(a, "--debug")      == 0) se_set_debug(1);
+            else if (std::strcmp(a, "--default-gw") == 0) want_default_gw = true;
+            else if (std::strcmp(a, "--no-verify")  == 0) verify_cert = false;
+            else if (std::strcmp(a, "--ca")         == 0 && i + 1 < argc) ca_path  = argv[++i];
+            else if (std::strcmp(a, "--tun")        == 0 && i + 1 < argc) tun_name = argv[++i];
+            else if (std::strcmp(a, "--keepalive")  == 0 && i + 1 < argc) keepalive = std::atoi(argv[++i]);
+            else if (std::strcmp(a, "--proxy")      == 0) {
+                want_proxy = true;
+                if (i + 1 < argc && argv[i+1][0] != '-')
+                    proxy_port = std::atoi(argv[++i]);
+            } else {
+                fprintf(stderr, "Unknown option: %s\n", a); return 1;
+            }
+        } else {
+            switch (pos++) {
+                case 0: s_host = a; break;
+                case 1: port   = std::atoi(a); break;
+                case 2: s_hub  = a; break;
+                case 3: s_user = a; break;
+                case 4: s_pass = a; break;
+                default:
+                    fprintf(stderr, "Extra positional argument: %s\n", a);
+                    return 1;
+            }
+        }
+    }
+
+    if (s_host.empty() || s_user.empty()) {
+        fprintf(stderr, "error: host and user are required (positional, env, or --config)\n");
         return 1;
     }
 
-    const char *host     = argv[1];
-    int         port     = atoi(argv[2]);
-    const char *hub      = argv[3];
-    const char *user     = argv[4];
-    const char *pass     = argv[5];
-    int         authtype = SE_AUTH_PASSWORD;
+    const char *host = s_host.c_str();
+    const char *hub  = s_hub.c_str();
+    const char *user = s_user.c_str();
+    const char *pass = s_pass.c_str();
 
-    bool want_default_gw = false;
-    bool want_proxy      = false;
-    int  proxy_port      = 1080;
-
-    for (int i = 6; i < argc; ++i) {
-        if (strcmp(argv[i], "--radius")     == 0) authtype = SE_AUTH_PLAIN_PASSWORD;
-        if (strcmp(argv[i], "--debug")      == 0) se_set_debug(1);
-        if (strcmp(argv[i], "--default-gw") == 0) want_default_gw = true;
-        if (strcmp(argv[i], "--proxy")      == 0) {
-            want_proxy = true;
-            if (i + 1 < argc && argv[i+1][0] != '-')
-                proxy_port = atoi(argv[++i]);
-        }
-    }
+    /* Apply runtime config to the library. */
+    se_set_verify_cert(verify_cert ? 1 : 0);
+    if (!ca_path.empty()) se_set_ca_path(ca_path.c_str());
+    if (keepalive > 0)    se_set_keepalive(keepalive);
 
     printf("Connecting to %s:%d hub=%s user=%s authtype=%d …\n",
            host, port, hub, user, authtype);
@@ -252,15 +412,15 @@ int main(int argc, char *argv[]) {
     printf("GW    : %s\n",    ip.gw);
     printf("DNS   : %s\n",    ip.dns);
 
-    g_tun_fd = tun_open("sevpn0");
+    g_tun_fd = tun_open(tun_name.c_str());
     if (g_tun_fd < 0) return 1;
 
-    if (!net_if_up("sevpn0", ip.ip, ip.prefix)) {
-        fprintf(stderr, "Failed to configure sevpn0\n");
+    if (!net_if_up(tun_name.c_str(), ip.ip, ip.prefix)) {
+        fprintf(stderr, "Failed to configure %s\n", tun_name.c_str());
         close(g_tun_fd);
         return 1;
     }
-    printf("Interface sevpn0 up: %s/%d\n", ip.ip, ip.prefix);
+    printf("Interface %s up: %s/%d\n", tun_name.c_str(), ip.ip, ip.prefix);
 
     uint32_t srv_ip_net = 0;
     uint32_t orig_gw    = 0;
@@ -281,14 +441,15 @@ int main(int argc, char *argv[]) {
 
         uint32_t vpn_gw = 0;
         inet_pton(AF_INET, ip.gw, &vpn_gw);
-        int vpn_oif = static_cast<int>(if_nametoindex("sevpn0"));
+        int vpn_oif = static_cast<int>(if_nametoindex(tun_name.c_str()));
         net_route_add(0, 0, vpn_gw, vpn_oif);
         printf("Default route via VPN (%s)\n", ip.gw);
 
         /* Best-effort DNS (systemd-resolved; silent if absent) */
         if (*ip.dns) {
-            char cmd[128];
-            snprintf(cmd, sizeof(cmd), "resolvectl dns sevpn0 %s 2>/dev/null", ip.dns);
+            char cmd[160];
+            snprintf(cmd, sizeof(cmd), "resolvectl dns %s %s 2>/dev/null",
+                     tun_name.c_str(), ip.dns);
             system(cmd);
         }
     }
@@ -306,7 +467,7 @@ int main(int argc, char *argv[]) {
     signal(SIGINT,  on_signal);
     signal(SIGTERM, on_signal);
 
-    printf("Forwarding. Press Ctrl-C to disconnect.\n");
+    printf("Forwarding. SIGINT/SIGTERM to disconnect.\n");
     rc = se_run(g_tun_fd);
 
     se_proxy_stop();
@@ -319,7 +480,7 @@ int main(int argc, char *argv[]) {
         if (orig_gw)    net_route_add(0, 0, orig_gw, orig_oif); /* restore */
     }
 
-    net_if_down("sevpn0");
+    net_if_down(tun_name.c_str());
     close(g_tun_fd);
 
     printf("Done (rc=%d).\n", rc);
