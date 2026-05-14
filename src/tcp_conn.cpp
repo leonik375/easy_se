@@ -309,21 +309,34 @@ ssize_t VpnTcpConn::recv(void *buf, size_t len) {
 
 /* ── close ───────────────────────────────────────────────────────────────── */
 
+/* Idempotent and safe under concurrent callers (proxy bridge_rx and
+   bridge_tx both call close() when their side of the conn drains).
+   Critical: we MUST always join the retx thread before VpnTcpConn is
+   destroyed, even if state_ is already CLOSED — otherwise the std::thread
+   member destructor finds it joinable and calls std::terminate(). */
 void VpnTcpConn::close() {
-    bool should_fin = false;
+    bool should_fin        = false;
+    bool should_unregister = false;
     {
         std::lock_guard<std::mutex> lk(mtx_);
-        if (state_ == State::CLOSED) return;
-        if (state_ == State::ESTABLISHED || state_ == State::CLOSE_WAIT)
-            should_fin = true;
-        state_     = State::CLOSED;
-        rx_eof_    = true;
+        if (state_ != State::CLOSED) {
+            if (state_ == State::ESTABLISHED || state_ == State::CLOSE_WAIT)
+                should_fin = true;
+            state_            = State::CLOSED;
+            rx_eof_           = true;
+            should_unregister = true;
+        }
         stop_retx_ = true;
         cv_.notify_all();
     }
-    if (should_fin) send_segment(0x11);        /* FIN + ACK */
-    if (retx_thread_.joinable()) retx_thread_.join();
-    vpn_tcp_unregister(local_port_);
+    if (should_fin) send_segment(0x11);            /* FIN + ACK */
+    /* Join exactly once across all close() callers.  call_once parks any
+       second caller until the first finishes, so neither winds up with a
+       half-joined std::thread. */
+    std::call_once(retx_join_once_, [this] {
+        if (retx_thread_.joinable()) retx_thread_.join();
+    });
+    if (should_unregister) vpn_tcp_unregister(local_port_);
 }
 
 /* ── deliver (called from recv loop, no locks held by caller) ────────────── */

@@ -119,6 +119,10 @@ private:
     uint32_t            last_ack_   = 0;            /* most recent ACK seen   */
     std::thread         retx_thread_;
     bool                stop_retx_  = false;
+    /* Guards retx_thread_.join() so concurrent close() calls from
+       bridge_rx and bridge_tx (and the destructor) can't all race onto
+       join() simultaneously (UB on the same std::thread). */
+    std::once_flag      retx_join_once_;
 
     static constexpr int RTO_INITIAL_MS = 200;      /* aggressive for lossy paths */
     static constexpr int RTO_MAX_MS     = 32000;
