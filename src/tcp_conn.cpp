@@ -109,7 +109,9 @@ void VpnTcpConn::send_segment_seq(uint8_t flags, uint32_t seq,
 
     tcp[12] = 0x50;                            /* data offset = 5 (20 bytes) */
     tcp[13] = flags;
-    tcp[14] = 0xff; tcp[15] = 0xff;            /* window = 65535 */
+    /* Advertise our remaining receive-buffer capacity (no window scaling). */
+    tcp[14] = static_cast<uint8_t>(rcv_wnd_ >> 8);
+    tcp[15] = static_cast<uint8_t>(rcv_wnd_ & 0xff);
 
     if (dlen) memcpy(tcp + TCP_HDR, data, dlen);
 
@@ -135,6 +137,15 @@ void VpnTcpConn::drain_reorder_() {
         oo_buf_.erase(it);
         it = oo_buf_.find(rcv_nxt_);
     }
+}
+
+/* Recompute the advertised receive window from current rx_buf_ usage.
+   Caller holds mtx_. */
+static inline uint16_t calc_rcv_wnd(size_t buffered) {
+    constexpr size_t MAX = 256 * 1024;       /* keep in sync with RX_MAX_BUF */
+    if (buffered >= MAX) return 0;
+    size_t free_bytes = MAX - buffered;
+    return static_cast<uint16_t>(std::min<size_t>(65535, free_bytes));
 }
 
 /* Retransmit loop.  Sleeps until either the head retx segment's RTO expires
@@ -305,23 +316,34 @@ bool VpnTcpConn::send(const void *buf, size_t len) {
 /* ── recv ────────────────────────────────────────────────────────────────── */
 
 ssize_t VpnTcpConn::recv(void *buf, size_t len) {
-    std::unique_lock<std::mutex> lk(mtx_);
-    cv_.wait(lk, [this] {
-        return rx_read_pos_ < rx_buf_.size() || rx_eof_;
-    });
-    size_t avail = rx_buf_.size() - rx_read_pos_;
-    if (avail == 0) return 0;                  /* EOF */
-    size_t n = std::min(len, avail);
-    memcpy(buf, rx_buf_.data() + rx_read_pos_, n);
-    rx_read_pos_ += n;
-    /* Compact when more than half the buffer is consumed — keeps memory
-       bounded without doing it on every read (O(amortised 1)). */
-    if (rx_read_pos_ > 0 && rx_read_pos_ >= rx_buf_.size() / 2) {
-        rx_buf_.erase(rx_buf_.begin(),
-                      rx_buf_.begin() + static_cast<ptrdiff_t>(rx_read_pos_));
-        rx_read_pos_ = 0;
+    bool send_window_update = false;
+    ssize_t out;
+    {
+        std::unique_lock<std::mutex> lk(mtx_);
+        cv_.wait(lk, [this] {
+            return rx_read_pos_ < rx_buf_.size() || rx_eof_;
+        });
+        size_t avail = rx_buf_.size() - rx_read_pos_;
+        if (avail == 0) return 0;              /* EOF */
+        size_t n = std::min(len, avail);
+        memcpy(buf, rx_buf_.data() + rx_read_pos_, n);
+        rx_read_pos_ += n;
+        /* Compact when more than half the buffer is consumed — keeps memory
+           bounded without doing it on every read (O(amortised 1)). */
+        if (rx_read_pos_ > 0 && rx_read_pos_ >= rx_buf_.size() / 2) {
+            rx_buf_.erase(rx_buf_.begin(),
+                          rx_buf_.begin() + static_cast<ptrdiff_t>(rx_read_pos_));
+            rx_read_pos_ = 0;
+        }
+        uint16_t old_wnd = rcv_wnd_;
+        rcv_wnd_ = calc_rcv_wnd(rx_buf_.size() - rx_read_pos_ + oo_total_);
+        /* If the peer was stalled at our zero-window, send an explicit
+           window-update ACK so it doesn't sit on a persist timer. */
+        if (old_wnd == 0 && rcv_wnd_ > 0) send_window_update = true;
+        out = static_cast<ssize_t>(n);
     }
-    return static_cast<ssize_t>(n);
+    if (send_window_update) send_segment(0x10);   /* ACK with new window */
+    return out;
 }
 
 /* ── close ───────────────────────────────────────────────────────────────── */
@@ -466,15 +488,21 @@ void VpnTcpConn::deliver(const uint8_t *tcp, size_t tcp_len, uint32_t src_ip_net
         case State::ESTABLISHED:
             if (data_len > 0) {
                 int32_t off = static_cast<int32_t>(seq - rcv_nxt_);
+                size_t  buffered = rx_buf_.size() - rx_read_pos_;
                 if (off == 0) {
-                    /* In-order: append and drain any contiguous reorder
-                       entries that now follow. */
-                    rx_buf_.insert(rx_buf_.end(), data, data + data_len);
-                    rcv_nxt_ += static_cast<uint32_t>(data_len);
-                    drain_reorder_();
+                    /* In-order: refuse if it would exceed RX_MAX_BUF
+                       (caps unbounded rx_buf_ growth → 1.5 GB RES leak).
+                       Peer will retransmit when our window re-opens. */
+                    if (buffered + data_len <= RX_MAX_BUF) {
+                        rx_buf_.insert(rx_buf_.end(), data, data + data_len);
+                        rcv_nxt_ += static_cast<uint32_t>(data_len);
+                        drain_reorder_();
+                        cv_.notify_all();
+                    }
+                    rcv_wnd_ = calc_rcv_wnd(rx_buf_.size() - rx_read_pos_);
                     send_ack = true;
-                    cv_.notify_all();
-                } else if (off > 0 && oo_total_ + data_len <= OO_MAX) {
+                } else if (off > 0 && oo_total_ + data_len <= OO_MAX &&
+                           buffered + oo_total_ + data_len <= RX_MAX_BUF) {
                     /* Out-of-order: buffer it.  Send a dup ACK on rcv_nxt_
                        so the sender knows about the gap. */
                     if (oo_buf_.find(seq) == oo_buf_.end()) {
@@ -482,6 +510,7 @@ void VpnTcpConn::deliver(const uint8_t *tcp, size_t tcp_len, uint32_t src_ip_net
                             std::vector<uint8_t>(data, data + data_len));
                         oo_total_ += data_len;
                     }
+                    rcv_wnd_ = calc_rcv_wnd(buffered + oo_total_);
                     send_ack = true;
                 } else if (off < 0) {
                     /* Duplicate (already received) — re-ACK to advance peer. */

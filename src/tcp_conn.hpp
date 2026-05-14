@@ -105,7 +105,13 @@ private:
        the gap before them gets filled. */
     std::map<uint32_t, std::vector<uint8_t>> oo_buf_;
     size_t                                   oo_total_ = 0;
-    static constexpr size_t OO_MAX = 256 * 1024;   /* bound memory */
+    static constexpr size_t OO_MAX     = 64  * 1024;   /* bound memory */
+    static constexpr size_t RX_MAX_BUF = 256 * 1024;   /* total rx_buf_ cap */
+
+    /* Our advertised receive window — sent in every outbound segment's
+       TCP header so the peer never overflows our buffer.  Updated as
+       rx_buf_ fills (in deliver) or drains (in recv). */
+    uint16_t rcv_wnd_ = 65535;
 
     bool rx_eof_       = false;
     bool connect_done_ = false;
