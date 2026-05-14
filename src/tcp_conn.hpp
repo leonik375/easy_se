@@ -82,9 +82,14 @@ private:
     uint32_t remote_ip_net_ = 0;
     uint16_t local_port_    = 0;
     uint16_t remote_port_   = 0;
-    uint32_t snd_nxt_       = 0;   /* next seq byte to send     */
-    uint32_t snd_una_       = 0;   /* oldest unacked seq        */
-    uint32_t rcv_nxt_       = 0;   /* next expected from remote */
+    uint32_t snd_nxt_       = 0;   /* next seq byte to send         */
+    uint32_t snd_una_       = 0;   /* oldest unacked seq            */
+    uint32_t rcv_nxt_       = 0;   /* next expected from remote     */
+    /* Peer's advertised receive window, updated on every inbound
+       segment.  send() blocks once (snd_nxt_ - snd_una_) >= snd_wnd_
+       — without this we kept blasting through a full peer buffer and
+       wrecked upload throughput. */
+    uint32_t snd_wnd_       = 65535;
 
     State state_ = State::CLOSED;
 

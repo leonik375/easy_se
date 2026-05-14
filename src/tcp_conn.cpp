@@ -268,17 +268,28 @@ bool VpnTcpConn::send(const void *buf, size_t len) {
         std::unique_lock<std::mutex> lk(mtx_);
         if (state_ != State::ESTABLISHED) return false;
 
-        size_t chunk = std::min(len, MSS);
+        /* Wait until the peer's advertised window has room for at least
+           one byte.  Without this we kept stuffing packets through a
+           full peer buffer → server drops → we retransmit → loop;
+           catastrophic upload throughput and unbounded retx_q_ growth
+           (the source of the 360 MB resident memory). */
+        cv_.wait(lk, [this] {
+            return state_ != State::ESTABLISHED ||
+                   (snd_nxt_ - snd_una_) < snd_wnd_;
+        });
+        if (state_ != State::ESTABLISHED) return false;
+
+        uint32_t in_flight = snd_nxt_ - snd_una_;
+        uint32_t avail     = (snd_wnd_ > in_flight) ? snd_wnd_ - in_flight : 0;
+        size_t   chunk     = std::min(len, MSS);
+        if (chunk > avail) chunk = avail;
+
         uint32_t seq = snd_nxt_;
         std::vector<uint8_t> data(p, p + chunk);
 
         send_segment_seq(0x18, seq, data.data(), chunk); /* PSH+ACK */
         snd_nxt_ += static_cast<uint32_t>(chunk);
 
-        /* Queue for potential retransmit until ACKed.  Only notify when
-           we add to an empty queue — if entries were already there, the
-           retx thread is sleeping on the head's deadline, and new tail
-           entries don't change that deadline. */
         bool was_empty = retx_q_.empty();
         retx_q_.push_back({seq, std::move(data),
                           std::chrono::steady_clock::now(), 0});
@@ -379,6 +390,9 @@ void VpnTcpConn::deliver(const uint8_t *tcp, size_t tcp_len, uint32_t src_ip_net
     bool fin      = flags & 0x01;
     bool ack_flag = flags & 0x10;
 
+    /* Peer's advertised receive window (no window-scaling option). */
+    uint16_t peer_wnd = (static_cast<uint16_t>(tcp[14]) << 8) | tcp[15];
+
     bool send_ack             = false;
     bool fast_retx            = false;
     uint32_t fast_retx_seq    = 0;
@@ -395,6 +409,14 @@ void VpnTcpConn::deliver(const uint8_t *tcp, size_t tcp_len, uint32_t src_ip_net
             stop_retx_    = true;
             cv_.notify_all();
             return;
+        }
+
+        /* Update send window from every inbound segment (ACK or not).
+           Wakes any send() blocked on a previously-full window. */
+        {
+            uint32_t old_wnd = snd_wnd_;
+            snd_wnd_ = peer_wnd;
+            if (snd_wnd_ > old_wnd) cv_.notify_all();
         }
 
         /* Process ACK: drop ACKed segments from retx_q_, detect dup ACKs
