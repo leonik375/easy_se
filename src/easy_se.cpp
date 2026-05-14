@@ -66,19 +66,44 @@ static std::unordered_map<uint32_t, ArpEntry> g_arp_cache;
 /* Rate-limit outbound ARP requests on cache misses: ip → time of last request. */
 static std::unordered_map<uint32_t, std::chrono::steady_clock::time_point> g_arp_requested;
 
+/* Pending-ARP packet queue.  When the ARP for a destination isn't resolved
+   yet, outbound IP packets land here keyed by lookup_ip (the gateway for
+   off-subnet, the host itself for on-subnet).  They are flushed onto the
+   tunnel the moment the ARP reply lands (see arp_cache_put → drain).
+   Without this, every first-packet-to-a-new-host went out as Ethernet
+   broadcast and was silently dropped by SoftEther SecureNAT. */
+struct PendingPacket {
+    std::vector<uint8_t>                  ip_pkt;
+    std::chrono::steady_clock::time_point queued_at;
+};
+static std::mutex g_pending_arp_mutex;
+static std::unordered_map<uint32_t, std::deque<PendingPacket>> g_pending_arp;
+static constexpr size_t PENDING_MAX_PER_IP = 8;
+static constexpr size_t PENDING_MAX_TOTAL  = 128;
+static constexpr int    PENDING_TIMEOUT_MS = 2000;
+static size_t           g_pending_arp_total = 0;
+
 /* TCP demux: local port → VpnTcpConn for userspace proxy connections. */
 static std::mutex g_tcp_demux_mutex;
 static std::unordered_map<uint16_t, VpnTcpConn*> g_tcp_demux;
 
+/* Forward decl — defined after vpn_send_frame() is known. */
+static void arp_queue_drain(uint32_t ip_net, const uint8_t *mac);
+
 static void arp_cache_put(uint32_t ip_net, const uint8_t *mac) {
     DBG("[arp-learn] ip=%08x mac=%02x:%02x:%02x:%02x:%02x:%02x\n",
         ip_net, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-    std::lock_guard<std::mutex> lk(g_arp_mutex);
-    auto &e      = g_arp_cache[ip_net];
-    memcpy(e.mac.data(), mac, 6);
-    e.learned_at = std::chrono::steady_clock::now();
-    e.probing    = false;
-    g_arp_requested.erase(ip_net);
+    {
+        std::lock_guard<std::mutex> lk(g_arp_mutex);
+        auto &e      = g_arp_cache[ip_net];
+        memcpy(e.mac.data(), mac, 6);
+        e.learned_at = std::chrono::steady_clock::now();
+        e.probing    = false;
+        g_arp_requested.erase(ip_net);
+    }
+    /* Drain outside the arp-cache lock to avoid lock-order issues with
+       the tunnel send path. */
+    arp_queue_drain(ip_net, mac);
 }
 
 static void arp_cache_clear() {
@@ -88,9 +113,45 @@ static void arp_cache_clear() {
         g_arp_requested.clear();
     }
     {
+        std::lock_guard<std::mutex> lk(g_pending_arp_mutex);
+        g_pending_arp.clear();
+        g_pending_arp_total = 0;
+    }
+    {
         std::lock_guard<std::mutex> lk(g_tcp_demux_mutex);
         g_tcp_demux.clear();
     }
+}
+
+/* Stash a packet awaiting ARP resolution.  Drops at the per-IP and
+   total caps to keep memory bounded.  Called from the tun_reader
+   when resolve_dst_mac misses the cache. */
+static bool arp_queue_push(uint32_t lookup_ip, const uint8_t *ip_pkt, size_t n) {
+    auto now = std::chrono::steady_clock::now();
+    auto cutoff = now - std::chrono::milliseconds(PENDING_TIMEOUT_MS);
+
+    std::lock_guard<std::mutex> lk(g_pending_arp_mutex);
+
+    /* Expire stale entries across all queues before counting capacity. */
+    for (auto it = g_pending_arp.begin(); it != g_pending_arp.end(); ) {
+        while (!it->second.empty() && it->second.front().queued_at < cutoff) {
+            it->second.pop_front();
+            g_pending_arp_total--;
+        }
+        if (it->second.empty()) it = g_pending_arp.erase(it);
+        else                    ++it;
+    }
+
+    auto &q = g_pending_arp[lookup_ip];
+    if (q.size() >= PENDING_MAX_PER_IP ||
+        g_pending_arp_total >= PENDING_MAX_TOTAL) {
+        DBG("[arp-queue] full for %08x (per_ip=%zu total=%zu) — dropping\n",
+            lookup_ip, q.size(), g_pending_arp_total);
+        return false;
+    }
+    q.push_back({std::vector<uint8_t>(ip_pkt, ip_pkt + n), now});
+    g_pending_arp_total++;
+    return true;
 }
 
 /* Return subnet mask in network byte order from prefix length. */
@@ -118,14 +179,15 @@ static void send_arp_request(uint32_t target_ip_net) {
 }
 
 /* Fill dst_mac for an outbound IPv4 packet (ip_pkt, n bytes).
-   For both in-subnet and off-subnet (gateway) destinations, look up the ARP
-   cache and send an ARP request on a miss.  Using a fixed gw_mac would pin
-   whichever DHCP server answered first (e.g. SecureNAT), so we let ARP
-   discover the real gateway MAC dynamically instead. */
-static void resolve_dst_mac(const uint8_t *ip_pkt, ssize_t n, uint8_t *dst_mac) {
-    if (n < 20) { memset(dst_mac, 0xff, 6); return; }
+   Returns true if dst_mac is filled and the caller should send.  Returns
+   false if the packet was queued pending ARP resolution — the caller must
+   drop its copy and not send.  Queued packets are flushed onto the wire
+   by arp_queue_drain() when the matching ARP reply arrives. */
+static bool resolve_dst_mac(const uint8_t *ip_pkt, ssize_t n, uint8_t *dst_mac) {
+    if (n < 20) return false;          /* malformed — drop quietly */
 
-    uint32_t dst_net   = *reinterpret_cast<const uint32_t*>(ip_pkt + 16);
+    uint32_t dst_net;
+    memcpy(&dst_net, ip_pkt + 16, sizeof(dst_net));   /* unaligned-safe */
     uint32_t mask      = prefix_mask(g_ip.prefix);
     uint32_t gw_net    = (uint32_t)inet_addr(g_ip.gw.c_str());
     uint32_t lookup_ip = ((dst_net & mask) == (g_ip.our_ip_net & mask))
@@ -134,7 +196,9 @@ static void resolve_dst_mac(const uint8_t *ip_pkt, ssize_t n, uint8_t *dst_mac) 
     using Clock  = std::chrono::steady_clock;
     using Sec    = std::chrono::seconds;
     auto now     = Clock::now();
-    bool need_arp = false;
+
+    bool need_arp = false;   /* fire ARP request after lock release */
+    bool have_mac = false;   /* dst_mac is filled and usable           */
 
     {
         std::lock_guard<std::mutex> lk(g_arp_mutex);
@@ -142,41 +206,38 @@ static void resolve_dst_mac(const uint8_t *ip_pkt, ssize_t n, uint8_t *dst_mac) 
         if (it != g_arp_cache.end()) {
             ArpEntry &e = it->second;
             if (!e.probing) {
-                /* Entry is current (or first-seen stale) — give caller the MAC */
                 memcpy(dst_mac, e.mac.data(), 6);
+                have_mac = true;
                 auto age = std::chrono::duration_cast<Sec>(now - e.learned_at).count();
                 if (age >= ARP_STALE_SEC) {
-                    /* Gone stale: fire a background NUD probe, keep using cached MAC */
+                    /* Stale: keep using cached MAC, fire NUD probe in background. */
                     DBG("[resolve] stale ip=%08x age=%llds, NUD probe\n",
                         lookup_ip, (long long)age);
                     e.probing   = true;
                     e.probed_at = now;
-                    need_arp    = true; /* send probe after lock release */
+                    need_arp    = true;
                 } else {
                     DBG("[resolve] arp-hit ip=%08x\n", lookup_ip);
                 }
-                if (!need_arp) return; /* fresh hit — nothing more to do */
             } else {
-                /* NUD probe already in flight */
                 auto probe_age = std::chrono::duration_cast<Sec>(
                                      now - e.probed_at).count();
                 if (probe_age < ARP_PROBE_TIMEOUT_SEC) {
-                    /* Still waiting for the reply — use cached MAC */
+                    /* Probe in flight, cached MAC still usable. */
                     memcpy(dst_mac, e.mac.data(), 6);
+                    have_mac = true;
                     DBG("[resolve] probing ip=%08x probe_age=%llds\n",
                         lookup_ip, (long long)probe_age);
-                    return;
+                } else {
+                    /* Probe timed out — evict, queue, send fresh ARP. */
+                    DBG("[resolve] NUD timeout ip=%08x, evicting\n", lookup_ip);
+                    g_arp_cache.erase(it);
+                    g_arp_requested[lookup_ip] = now;
+                    need_arp = true;
                 }
-                /* Probe timed out — MAC is stale, evict and re-ARP */
-                DBG("[resolve] NUD timeout ip=%08x, evicting\n", lookup_ip);
-                g_arp_cache.erase(it);
-                memset(dst_mac, 0xff, 6);
-                g_arp_requested[lookup_ip] = now;
-                need_arp = true;
             }
         } else {
-            /* Cache miss — broadcast for this packet, rate-limited ARP request */
-            memset(dst_mac, 0xff, 6);
+            /* Plain cache miss — packet will be queued; rate-limit ARP fires. */
             auto pit = g_arp_requested.find(lookup_ip);
             if (pit == g_arp_requested.end() ||
                 now - pit->second > Sec(1)) {
@@ -186,6 +247,13 @@ static void resolve_dst_mac(const uint8_t *ip_pkt, ssize_t n, uint8_t *dst_mac) 
         }
     }
     if (need_arp) send_arp_request(lookup_ip);
+    if (have_mac) return true;
+
+    /* No usable MAC — queue the packet and tell caller to drop its
+       outbound attempt.  arp_queue_drain() will send the packet when
+       the ARP reply arrives (or it'll expire after PENDING_TIMEOUT_MS). */
+    arp_queue_push(lookup_ip, ip_pkt, static_cast<size_t>(n));
+    return false;
 }
 
 /* ---- private helpers ---- */
@@ -267,6 +335,37 @@ bool vpn_send_frame(const uint8_t *eth, size_t len) {
     return g_tunnel.udp_active()
            ? g_tunnel.send_udp_frame(eth, len)
            : g_tunnel.send_frame(eth, len);
+}
+
+/* Flush all packets queued for ip_net (because their ARP wasn't resolved
+   when they came out of the kernel) onto the tunnel using the freshly
+   learned MAC.  Called from arp_cache_put once a reply lands. */
+static void arp_queue_drain(uint32_t ip_net, const uint8_t *mac) {
+    std::deque<PendingPacket> drained;
+    {
+        std::lock_guard<std::mutex> lk(g_pending_arp_mutex);
+        auto it = g_pending_arp.find(ip_net);
+        if (it == g_pending_arp.end()) return;
+        drained = std::move(it->second);
+        g_pending_arp_total -= drained.size();
+        g_pending_arp.erase(it);
+    }
+    auto now    = std::chrono::steady_clock::now();
+    auto cutoff = now - std::chrono::milliseconds(PENDING_TIMEOUT_MS);
+    DBG("[arp-queue] draining %zu packets for %08x\n", drained.size(), ip_net);
+
+    uint8_t frame[ETH_HDR + MAX_PKT];
+    memcpy(frame,     mac,            6);
+    memcpy(frame + 6, g_ip.our_mac,   6);
+    frame[12] = 0x08; frame[13] = 0x00;        /* IPv4 ethertype */
+
+    for (auto &pp : drained) {
+        if (pp.queued_at < cutoff) continue;   /* too stale to send */
+        size_t total = ETH_HDR + pp.ip_pkt.size();
+        if (total > sizeof(frame)) continue;   /* shouldn't happen — guard anyway */
+        memcpy(frame + ETH_HDR, pp.ip_pkt.data(), pp.ip_pkt.size());
+        vpn_send_frame(frame, total);
+    }
 }
 
 void vpn_tcp_register(uint16_t port, VpnTcpConn *conn) {
@@ -416,7 +515,8 @@ static bool run_once(int tun_fd) {
                 continue;
             }
 
-            resolve_dst_mac(ip_pkt, n, eth_frame);
+            if (!resolve_dst_mac(ip_pkt, n, eth_frame))
+                continue;   /* queued pending ARP — sent from arp_queue_drain */
             memcpy(eth_frame + ETH_HDR, ip_pkt, static_cast<size_t>(n));
 
             DBG("[run] tun→vpn %zd bytes proto=0x%02x dst=%02x:%02x:%02x:%02x:%02x:%02x\n",
