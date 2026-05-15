@@ -142,7 +142,7 @@ void VpnTcpConn::drain_reorder_() {
 /* Recompute the advertised receive window from current rx_buf_ usage.
    Caller holds mtx_. */
 static inline uint16_t calc_rcv_wnd(size_t buffered) {
-    constexpr size_t MAX = 256 * 1024;       /* keep in sync with RX_MAX_BUF */
+    constexpr size_t MAX = VpnTcpConn::RX_MAX_BUF;
     if (buffered >= MAX) return 0;
     size_t free_bytes = MAX - buffered;
     return static_cast<uint16_t>(std::min<size_t>(65535, free_bytes));

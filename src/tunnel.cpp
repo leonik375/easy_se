@@ -317,9 +317,11 @@ bool Tunnel::connect(const std::string &host, int port,
             tx_stop_ = true;
         }
         tx_cv_.notify_all();
+        tx_space_cv_.notify_all();
         tx_thread_.join();
         std::lock_guard<std::mutex> lk(tx_mutex_);
         tx_queue_.clear();
+        tx_queue_bytes_ = 0;
     }
     host_ = host;
 
@@ -566,8 +568,26 @@ bool Tunnel::send_frame(const uint8_t *eth, size_t len) {
     if (len == 0 || len > 2048 + 14) return false;
     if (tx_dead_.load(std::memory_order_relaxed)) return false;
     {
-        std::lock_guard<std::mutex> lk(tx_mutex_);
+        std::unique_lock<std::mutex> lk(tx_mutex_);
+        /* Backpressure: block until the queue drains below the cap.
+           This throttles the producer (tun_reader / proxy bridge) so
+           the kernel slows the source instead of us buffering GBs.
+           Bounded wait so a dead tunnel doesn't wedge the producer. */
+        if (tx_queue_bytes_ >= TX_QUEUE_MAX_BYTES) {
+            tx_space_cv_.wait_for(lk, std::chrono::milliseconds(250),
+                [this] {
+                    return tx_stop_ ||
+                           tx_dead_.load(std::memory_order_relaxed) ||
+                           tx_queue_bytes_ < TX_QUEUE_MAX_BYTES;
+                });
+            if (tx_stop_ || tx_dead_.load(std::memory_order_relaxed))
+                return false;
+            /* Still over cap after the wait → drop this frame.  TCP
+               (kernel for direct, our retx for proxy) will recover. */
+            if (tx_queue_bytes_ >= TX_QUEUE_MAX_BYTES) return false;
+        }
         tx_queue_.emplace_back(eth, eth + len);
+        tx_queue_bytes_ += len;
     }
     tx_cv_.notify_one();
     return true;
@@ -597,11 +617,15 @@ void Tunnel::tx_loop_() {
                    frames.size() < TX_MAX_BATCH &&
                    total_bytes + tx_queue_.front().size() + 4 <=
                        TX_MAX_BATCH_BYTES) {
-                total_bytes += tx_queue_.front().size() + 4;
+                size_t fsz = tx_queue_.front().size();
+                total_bytes += fsz + 4;
+                tx_queue_bytes_ -= fsz;
                 frames.push_back(std::move(tx_queue_.front()));
                 tx_queue_.pop_front();
             }
         }
+        /* Drained some — wake any producer blocked on the cap. */
+        tx_space_cv_.notify_all();
 
         /* Build: uint32_BE(num_blocks) [ uint32_BE(size) bytes ... ] */
         batch.clear();
@@ -624,8 +648,12 @@ void Tunnel::tx_loop_() {
         if (!ok) {
             tx_dead_.store(true, std::memory_order_relaxed);
             /* Drain pending so memory doesn't grow until close() runs. */
-            std::lock_guard<std::mutex> lk(tx_mutex_);
-            tx_queue_.clear();
+            {
+                std::lock_guard<std::mutex> lk(tx_mutex_);
+                tx_queue_.clear();
+                tx_queue_bytes_ = 0;
+            }
+            tx_space_cv_.notify_all();   /* unblock any waiting producer */
             /* Stay in loop until tx_stop_ — close() will set it and join. */
         }
     }
@@ -1121,9 +1149,11 @@ void Tunnel::close() {
             tx_stop_ = true;
         }
         tx_cv_.notify_all();
+        tx_space_cv_.notify_all();
         tx_thread_.join();
         std::lock_guard<std::mutex> lk(tx_mutex_);
         tx_queue_.clear();
+        tx_queue_bytes_ = 0;
     }
     if (ssl_) { SSL_shutdown(ssl_); SSL_free(ssl_); ssl_ = nullptr; }
     if (ctx_) { SSL_CTX_free(ctx_); ctx_ = nullptr; }

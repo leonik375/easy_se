@@ -57,6 +57,11 @@ public:
     uint16_t local_port()    const { return local_port_;    }
     uint32_t remote_ip_net() const { return remote_ip_net_; }
 
+    /* Mobile-friendly buffer caps (public so the recv-window helper and
+       callers can size their own buffers consistently). */
+    static constexpr size_t OO_MAX     = 16 * 1024;
+    static constexpr size_t RX_MAX_BUF = 64 * 1024;
+
     /* Called by se_client's recv loop to deliver an inbound TCP segment.
        tcp_seg points to the TCP header; tcp_len = header + data length. */
     void deliver(const uint8_t *tcp_seg, size_t tcp_len, uint32_t src_ip_net);
@@ -105,8 +110,8 @@ private:
        the gap before them gets filled. */
     std::map<uint32_t, std::vector<uint8_t>> oo_buf_;
     size_t                                   oo_total_ = 0;
-    static constexpr size_t OO_MAX     = 64  * 1024;   /* bound memory */
-    static constexpr size_t RX_MAX_BUF = 256 * 1024;   /* total rx_buf_ cap */
+    /* OO_MAX / RX_MAX_BUF declared public above.  Per-connection memory
+       ceiling: rx_buf_ + oo_buf_ + retx_q_ ≈ 64+16+64 = 144 KB. */
 
     /* Our advertised receive window — sent in every outbound segment's
        TCP header so the peer never overflows our buffer.  Updated as

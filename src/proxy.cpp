@@ -108,6 +108,11 @@ static int dial(const char *host, int port) {
     pthread_attr_t attr;
     pthread_attr_init(&attr);
     pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    /* Bridge threads use a 4 KB stack buffer + small locals.  The default
+       thread stack is 8 MB (glibc) / 1 MB (Bionic); with 2 bridges per
+       proxy connection that virtual footprint dominates RSS pressure on
+       mobile.  128 KB is ample headroom for these threads. */
+    pthread_attr_setstacksize(&attr, 128 * 1024);
     pthread_create(&t, &attr, bridge_rx, new BridgeCtx{conn, sv[1]});
     pthread_create(&t, &attr, bridge_tx, new BridgeCtx{conn, sv[1]});
     pthread_attr_destroy(&attr);
@@ -369,6 +374,9 @@ void *ProxyServer::listener_thread(void *arg) {
         pthread_attr_t attr;
         pthread_attr_init(&attr);
         pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+        /* SOCKS5/HTTP parsing uses heap (std::string) + a 2 KB stack
+           buffer.  256 KB stack is plenty and a fraction of the default. */
+        pthread_attr_setstacksize(&attr, 256 * 1024);
         pthread_create(&t, &attr, handler_thread,
                        reinterpret_cast<void *>(static_cast<intptr_t>(cfd)));
         pthread_attr_destroy(&attr);

@@ -127,13 +127,21 @@ private:
        VPN packets.  Without batching, each small frame (84-200 B) was
        its own SSL_write → throughput cliff on bulk proxy traffic. */
     std::mutex                       tx_mutex_;
-    std::condition_variable          tx_cv_;
+    std::condition_variable          tx_cv_;       /* wakes tx_thread_     */
+    std::condition_variable          tx_space_cv_; /* wakes blocked sender */
     std::deque<std::vector<uint8_t>> tx_queue_;
+    size_t                           tx_queue_bytes_ = 0;
     std::thread                      tx_thread_;
     bool                             tx_stop_  = false;
     std::atomic<bool>                tx_dead_{false};
-    static constexpr size_t          TX_MAX_BATCH      = 32;
+    static constexpr size_t          TX_MAX_BATCH       = 32;
     static constexpr size_t          TX_MAX_BATCH_BYTES = 16 * 1024;
+    /* Hard cap on buffered-but-unsent bytes.  Past this, send_frame()
+       blocks the producer (tun_reader / proxy bridge) so the kernel
+       applies natural backpressure instead of us buffering gigabytes.
+       512 KB ≈ 34 ms at 120 Mbit/s — enough to keep the pipe full
+       without ballooning RSS on mobile. */
+    static constexpr size_t          TX_QUEUE_MAX_BYTES = 512 * 1024;
     void tx_loop_();
 
     /* Low-level SSL I/O */
